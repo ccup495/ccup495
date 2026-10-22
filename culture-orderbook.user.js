@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Culture Capital 호가창
 // @namespace    rere
-// @version      1.0.4
-// @description  왼쪽 종목 패널(고급 주문 아래)에 실시간 호가창을 표시합니다. (PC 전용, 휴대폰에서는 실행 안 함)
+// @version      1.0.5
+// @description  왼쪽 종목 패널(고급 주문 아래)에 실시간 호가창을 표시합니다. (PC·아이패드용, 휴대폰에서는 실행 안 함)
 // @match        https://mtr.culturecapitalllc.com/*
 // @run-at       document-start
 // @grant        none
@@ -10,7 +10,7 @@
 // @downloadURL  https://raw.githubusercontent.com/ccup495/ccup495/main/culture-orderbook.user.js
 // ==/UserScript==
 
-(function () {
+function ccobMain() {
   'use strict';
 
   // 휴대폰 브라우저에서는 사이트가 모바일 화면을 쓰는데, 호가창을 둘 자리가 없으므로 실행하지 않음
@@ -248,4 +248,20 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
+}
+
+// 아이패드 사파리(Userscripts), 파이어폭스 탬퍼몽키 등은 스크립트를 페이지와 분리된 샌드박스에서 실행해서
+// 사이트의 웹소켓을 엿볼 수 없으므로 항상 코드를 페이지에 직접 넣어 실행한다.
+// (이 사이트는 CSP가 없어 인라인 스크립트가 막히지 않고, 크롬처럼 원래 페이지에서 실행되는 경우에도 똑같이 동작한다)
+(function inject() {
+  const root = document.head || document.documentElement;
+  if (!root) {  // 아주 이른 시점이라 <html>도 아직 없으면 생길 때까지 기다림
+    new MutationObserver(function (m, o) { if (document.documentElement) { o.disconnect(); inject(); } })
+      .observe(document, { childList: true });
+    return;
+  }
+  const s = document.createElement('script');
+  s.textContent = '(' + ccobMain.toString() + ')();';
+  root.appendChild(s);
+  s.remove();
 })();
