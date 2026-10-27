@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Culture Capital 잔고 원화 표시
 // @namespace    https://mtr.culturecapitalllc.com/
-// @version      1.6.4
+// @version      1.6.5
 // @description  상단 잔고(USD)와 오픈 포지션·청산 포지션·재무의 금액에 네이버 환율(하나은행 매매기준율) 기준 원화 금액을 표시합니다. 모바일은 포트폴리오(시가·청산됨), 거래 화면 종목 손익 칩, 더보기 > 재무(Finance History)도 표시합니다.
 // @match        *://*.culturecapitalllc.com/*
 // @match        *://culturecapitalllc.com/*
@@ -12,12 +12,17 @@
 // @connect      api.stock.naver.com
 // @connect      m.search.naver.com
 // @run-at       document-idle
+// @noframes
 // @updateURL    https://raw.githubusercontent.com/ccup495/ccup495/main/culturecapital-krw.user.js
 // @downloadURL  https://raw.githubusercontent.com/ccup495/ccup495/main/culturecapital-krw.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // 차트(트레이딩뷰)는 같은 주소의 별도 프레임이라 거기서도 실행되면 차트 위에 상태 배지가 하나 더 뜸.
+  // @noframes를 무시하는 확장(아이폰 Userscripts 등)도 있어서 직접 한 번 더 확인함
+  if (window.top !== window.self) return;
 
   const RATE_REFRESH_MS = 5 * 60 * 1000; // 환율 갱신 주기: 5분
   const SCAN_MS = 1000;                  // 잔고 변화 확인 주기: 1초

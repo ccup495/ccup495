@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Culture Capital 원클릭 부분 청산
 // @namespace    rere
-// @version      1.0.0
-// @description  오픈 포지션에 25%·50%·75% 부분 청산과 본절(손절가 → 진입가) 버튼을 추가합니다. (PC: 표 오른쪽 칸, 모바일: 연필 버튼을 누르면 아래에서 올라오는 창)
+// @version      1.1.2
+// @description  오픈 포지션에 25%·50%·75% 부분 청산과 본절(손절가 → 진입가) 버튼을 추가합니다. (PC: 표 오른쪽 칸, 모바일: 연필 버튼의 부분 청산 창과 포지션 상세 화면)
 // @match        https://mtr.culturecapitalllc.com/*
 // @run-at       document-start
+// @noframes
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/ccup495/ccup495/main/culture-partial-close.user.js
 // @downloadURL  https://raw.githubusercontent.com/ccup495/ccup495/main/culture-partial-close.user.js
@@ -61,7 +62,8 @@ function ccpcMain() {
 
   async function loadOpen(force) {
     if (!st.uuid || !st.token || st.openLoading) return;
-    if (!force && Date.now() - st.openAt < 2500) return;
+    // 확인 창이 열려 있으면 예상 손익이 따라 움직이도록 1초마다, 아니면 2.5초마다
+    if (!force && Date.now() - st.openAt < (pop ? 1000 : 2500)) return;
     st.openLoading = true;
     try { st.open = (await api('GET', 'open-positions')).positions || []; st.openAt = Date.now(); } catch {}
     st.openLoading = false;
@@ -126,6 +128,8 @@ function ccpcMain() {
     if (pr == null || pr <= 0) return { ok: false, why: '수익 중일 때만 본절로 옮길 수 있어요' };
     return { ok: true };
   }
+
+  const findPos = id => id && st.open && st.open.find(x => String(x.id) === id);
 
   // ---------------------------------------------------------------- 실행
   async function doPartial(p, vol) {
@@ -206,6 +210,7 @@ function ccpcMain() {
   // ---------------------------------------------------------------- 공통 화면 조각
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const CSS = `
+  trade-open-positions-desktop .trade-open-positions-desktop__action-row{width:auto!important;min-width:0!important}
   .ccpc{display:inline-flex;gap:3px;align-items:center;margin-right:6px;vertical-align:middle}
   .ccpc button,.ccpc-h button{font:inherit;font-size:11px;line-height:1;padding:5px 6px;border-radius:6px;cursor:pointer;
     border:1px solid var(--border-primary,rgba(128,128,128,.3));background:var(--surface-primary,transparent);color:var(--content-primary,inherit);font-variant-numeric:tabular-nums}
@@ -230,29 +235,15 @@ function ccpcMain() {
   .ccpc-toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:100001;background:#1b2430;color:#fff;
     padding:9px 16px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:90vw;text-align:center}
   .ccpc-toast.err{background:#c62f42}
-  .ccpc-bg{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);display:flex;align-items:flex-end}
-  .ccpc-sheet{width:100%;background:var(--surface-primary,#fff);color:var(--content-primary,#1b2430);border-radius:18px 18px 0 0;
-    padding:10px 16px calc(18px + env(safe-area-inset-bottom,0px));display:grid;gap:12px;font-size:14px;max-height:85vh;overflow:auto}
-  .ccpc-sheet .grab{width:38px;height:4px;border-radius:2px;background:var(--border-primary,rgba(128,128,128,.35));justify-self:center}
-  .ccpc-sheet h3{margin:0;font-size:17px;display:flex;gap:8px;align-items:center}
-  .ccpc-chip{font-size:12px;font-weight:600;padding:1px 7px;border-radius:5px}
-  .ccpc-chip.sell{color:#e5374d;background:rgba(229,55,77,.12)}.ccpc-chip.buy{color:#0e9c8b;background:rgba(14,156,139,.12)}
-  .ccpc-pcts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-  .ccpc-pcts button{border:1px solid var(--border-primary,rgba(128,128,128,.3));background:none;color:inherit;border-radius:10px;padding:10px 0 8px;font:inherit;font-weight:700;font-size:16px;cursor:pointer;display:grid;gap:2px}
-  .ccpc-pcts button small{font-weight:400;font-size:11.5px;color:var(--content-secondary,#6b7684)}
-  .ccpc-pcts button.on{background:var(--content-primary,#1b2430);color:var(--surface-primary,#fff);border-color:transparent}
-  .ccpc-pcts button.on small{color:inherit;opacity:.75}
-  .ccpc-pcts button:disabled{opacity:.35}
-  .ccpc-sheet .ccpc-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-variant-numeric:tabular-nums}
-  .ccpc-sheet .ccpc-kv span:nth-child(odd){color:var(--content-secondary,#6b7684)}
-  .ccpc-sheet .ccpc-kv span:nth-child(even){text-align:right}
-  .ccpc-big{border:0;border-radius:12px;padding:14px;font:inherit;font-size:16px;font-weight:700;background:#0e9c8b;color:#fff;cursor:pointer}
-  .ccpc-big:disabled{opacity:.4}
-  .ccpc-sub{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .ccpc-sub button{border:1px solid var(--border-primary,rgba(128,128,128,.3));background:none;color:inherit;border-radius:10px;padding:11px 6px;font:inherit;font-size:13.5px;font-weight:600;cursor:pointer}
-  .ccpc-sub button:disabled{opacity:.4}
-  .ccpc-why{font-size:12px;color:var(--content-secondary,#6b7684);margin:-4px 0 0;text-align:center}
-  .ccpc-cancel{background:none;border:0;color:var(--content-secondary,#6b7684);font:inherit;font-size:14px;padding:4px;cursor:pointer}`;
+  .ccpc-m{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 0 10px}
+  .ccpc-m button{font:inherit;font-size:15px;font-weight:600;padding:11px 0;border-radius:10px;cursor:pointer;font-variant-numeric:tabular-nums;
+    border:1px solid var(--border-primary,rgba(128,128,128,.3));background:var(--surface-primary,transparent);color:var(--content-primary,inherit)}
+  .ccpc-m button:disabled{opacity:.35}
+  .ccpc-m button.be-done{background:rgba(14,156,139,.14);border-color:#0e9c8b;color:#0e9c8b;opacity:1}
+  .ccpc-m-dialog{margin-top:12px}
+  .ccpc-m-note{grid-column:1/-1;margin:-2px 0 0;font-size:12px;color:var(--content-secondary,#6b7684);text-align:center}
+  .ccpc-pop.m{left:12px!important;right:12px;max-width:none;font-size:14px;padding:14px 16px}
+  .ccpc-pop.m .ccpc-go,.ccpc-pop.m .ccpc-no{padding:9px 20px}`;
 
   let toastEl = null, toastTimer = 0;
   function toast(msg, err) {
@@ -266,11 +257,15 @@ function ccpcMain() {
 
   // ---------------------------------------------------------------- PC: 확인 창
   let pop = null;
-  function closePop() { if (pop) { pop.remove(); pop = null; } }
-  document.addEventListener('mousedown', e => { if (pop && !pop.contains(e.target) && !e.target.closest('.ccpc')) closePop(); }, true);
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePop(); closeSheet(); } });
+  function closePop() { if (pop) { pop.remove(); pop = null; } popObs.disconnect(); popWatched = null; }
+  // 확인 창이 열려 있는 동안 화면의 이익 숫자를 지켜보다가 사이트가 바꾸는 순간 예상 손익도 다시 계산
+  // (원화 표시와 같은 속도. 화면에서 숫자를 못 찾으면 서버에서 받은 값으로 1초마다)
+  const popObs = new MutationObserver(() => refreshPop());
+  let popWatched = null;
+  document.addEventListener('mousedown', e => { if (pop && !pop.contains(e.target) && !e.target.closest('.ccpc, .ccpc-m')) closePop(); }, true);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closePop(); });
 
-  function showPop(anchor, p, kind, f) {
+  function showPop(anchor, p, kind, f, mobile, onDone) {
     closePop();
     const pr = profitOf(p);
     let head, rows, go;
@@ -280,7 +275,7 @@ function ccpcMain() {
       head = `<b>${esc(name(p))} ${sideKo(p)} ${fmtVol(p, v)} lot 청산</b> <span style="opacity:.7">(${Math.round(f * 100)}%)</span>`;
       rows = `<span>남는 수량</span><span>${fmtVol(p, p.volume - v)} lot</span>
         <span>진입가</span><span>${fmtPrice(p, p.openPrice)}</span>
-        <span>예상 실현 이익</span><span class="${est > 0 ? 'ccpc-up' : est < 0 ? 'ccpc-down' : ''}">약 ${money(est)}</span>`;
+        <span>예상 실현 손익</span><span class="ccpc-est"></span>`;
       go = '청산';
     } else {
       head = `<b>${esc(name(p))} ${sideKo(p)} 본절</b>`;
@@ -289,11 +284,15 @@ function ccpcMain() {
       go = '옮기기';
     }
     pop = document.createElement('div');
-    pop.className = 'ccpc-pop';
+    pop.className = 'ccpc-pop' + (mobile ? ' m' : '');
     pop.innerHTML = `<div>${head}</div><div class="ccpc-kv">${rows}</div>
-      <div class="ccpc-row"><label><input type="checkbox" class="ccpc-skip"> 다음부터 바로 실행</label>
+      <div class="ccpc-row">${mobile ? '' : '<label><input type="checkbox" class="ccpc-skip"> 다음부터 바로 실행</label>'}
       <button class="ccpc-no">취소</button><button class="ccpc-go">${go}</button></div>`;
+    // 이익 숫자를 읽을 화면 줄: PC 표의 줄, 모바일 부분 청산 창이면 연필을 누른 줄 (상세 화면은 refreshPop에서 찾음)
+    const row = anchor.closest('ui-list-row') || (anchor.closest('.ccpc-m-dialog') ? pencilRow : null);
+    pop.__state = { id: String(p.id), kind, f, row };
     document.body.appendChild(pop);
+    refreshPop();
     const a = anchor.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
     let top = a.bottom + 6;
     if (top + h > innerHeight - 8) top = a.top - h - 6;
@@ -301,11 +300,47 @@ function ccpcMain() {
     pop.style.left = Math.max(8, Math.min(innerWidth - w - 8, a.right - w)) + 'px';
     pop.querySelector('.ccpc-no').onclick = closePop;
     pop.querySelector('.ccpc-go').onclick = () => {
-      if (pop.querySelector('.ccpc-skip').checked) setNoConfirm(true);
+      const skip = pop.querySelector('.ccpc-skip');
+      if (skip && skip.checked) setNoConfirm(true);
+      const cur = findPos(pop.__state.id) || p;  // 창을 띄운 뒤 바뀐 최신 포지션 정보로 실행
       closePop();
-      if (kind === 'pct') doPartial(p, closeVol(p, f)); else doBreakEven(p);
+      if (onDone) onDone();
+      if (kind === 'pct') doPartial(cur, closeVol(cur, f)); else doBreakEven(cur);
     };
     pop.querySelector('.ccpc-go').focus();
+  }
+
+  // 열려 있는 확인 창의 예상 손익을 최신 포지션 이익으로 다시 계산 (포지션이 사라졌으면 닫음)
+  function screenProfitEl(st8) {
+    const r = st8.row;
+    if (r && r.isConnected) {
+      const m = matchRows([r]).get(r);  // 가상 스크롤로 줄이 다른 포지션에 재사용됐는지 확인
+      if (m && String(m.id) === st8.id) return r.querySelector('[data-testid="open-position-profit-value"]');
+    }
+    if (detailId() === st8.id) return document.querySelector('[data-testid="open-position-mobile-profit"]');
+    return null;
+  }
+  // 원화 표시 스크립트가 붙인 글자는 빼고 그 요소 자체의 숫자만 읽음
+  const ownNum = el => { let t = ''; for (const n of el.childNodes) if (n.nodeType === 3) t += n.data; return num(t); };
+
+  function refreshPop() {
+    if (!pop || !pop.__state) return;
+    const { id, kind, f } = pop.__state;
+    const p = findPos(id);
+    if (!p) { closePop(); return; }
+    const el = pop.querySelector('.ccpc-est');
+    if (!el || kind !== 'pct') return;
+    const live = screenProfitEl(pop.__state);
+    if (live !== popWatched) {
+      popObs.disconnect(); popWatched = live;
+      if (live) popObs.observe(live, { characterData: true, childList: true, subtree: true });
+    }
+    const shown = live ? ownNum(live) : NaN;
+    const v = closeVol(p, f), pr = Number.isFinite(shown) ? shown : profitOf(p);
+    const est = pr == null || !v ? null : pr * v / p.volume;
+    const text = '약 ' + money(est);
+    if (el.textContent !== text) el.textContent = text;
+    el.className = 'ccpc-est' + (est > 0 ? ' ccpc-up' : est < 0 ? ' ccpc-down' : '');
   }
 
   function setNoConfirm(v) {
@@ -394,70 +429,69 @@ function ccpcMain() {
     showPop(b, p, kind, f);
   }
 
-  // ---------------------------------------------------------------- 모바일: 연필 버튼 → 아래 창
-  let sheet = null, sheetSel = 0.5, sheetPos = null, bypass = false;
-  function closeSheet() { if (sheet) { sheet.remove(); sheet = null; sheetPos = null; } }
-
+  // ---------------------------------------------------------------- 모바일: 버튼 줄 두 곳
+  // 1) 포지션을 눌러 들어간 상세 화면(/app/portfolio/open/<포지션 id>/info)의 "부분 청산" 버튼 위
+  // 2) 연필(부분 청산) 버튼을 누르면 올라오는 사이트 "부분 청산" 창의 수량 입력 칸 위
+  // 사이트의 연필 버튼과 창은 그대로 동작하고, 우리 버튼은 확인 창을 거쳐 실행한다
+  const detailId = () => (location.pathname.match(/\/portfolio\/open\/([^/]+)/) || [])[1] || null;
+  let pencilPosId = null, pencilRow = null;  // 마지막으로 누른 연필 버튼의 포지션과 줄 (사이트 창에는 포지션 정보가 없음)
   document.addEventListener('click', e => {
-    if (bypass) return;
     const btn = e.target.closest && e.target.closest('[data-testid="open-positions-mobile-partial-close-button"]');
-    if (!btn) return;
-    const row = btn.closest('ui-list-row');
-    const p = row && matchRows([row]).get(row);
-    if (!p || !rule(p)) return;  // 못 찾으면 사이트 창을 그대로 띄움
-    e.preventDefault(); e.stopImmediatePropagation();
-    openSheet(p, btn);
+    const row = btn && btn.closest('ui-list-row');
+    if (!row) return;
+    const p = matchRows([row]).get(row);
+    pencilPosId = p ? String(p.id) : null;
+    pencilRow = row;
   }, true);
 
-  function openSheet(p, siteBtn) {
-    closeSheet();
-    sheetPos = p.id;
-    if (!closeVol(p, sheetSel)) sheetSel = FRACS.find(f => closeVol(p, f)) || 0.5;
-    sheet = document.createElement('div');
-    sheet.className = 'ccpc-bg';
-    sheet.addEventListener('click', e => {
-      if (e.target === sheet) return closeSheet();
-      const b = e.target.closest('button');
-      if (!b || b.disabled) return;
-      const cur = st.open && st.open.find(x => x.id === sheetPos);
-      if (!cur) return closeSheet();
-      if (b.dataset.f) { sheetSel = +b.dataset.f; renderSheet(); }
-      else if (b.dataset.k === 'go') { closeSheet(); doPartial(cur, closeVol(cur, sheetSel)); }
-      else if (b.dataset.k === 'be') { closeSheet(); doBreakEven(cur); }
-      else if (b.dataset.k === 'manual') { closeSheet(); bypass = true; try { siteBtn.click(); } finally { bypass = false; } }
-      else if (b.dataset.k === 'cancel') closeSheet();
-    });
-    document.body.appendChild(sheet);
-    renderSheet();
+  function mobileBox(cls, anchor, padFrom, p, onDone) {
+    let box = document.querySelector('.' + cls);
+    if (!anchor || !p || !rule(p)) { if (box) box.remove(); return; }
+    if (!box || box.nextElementSibling !== anchor) {
+      if (box) box.remove();
+      box = document.createElement('div');
+      box.className = 'ccpc-m ' + cls;
+      box.addEventListener('click', e => {
+        const b = e.target.closest('button[data-ccpc]');
+        if (!b || b.disabled) return;
+        const cur = st.open && st.open.find(x => String(x.id) === box.dataset.id);
+        if (cur) showPop(b, cur, b.dataset.ccpc, +b.dataset.f, true, onDone);
+      });
+      anchor.before(box);
+    }
+    // 옆의 사이트 버튼 줄과 같은 좌우 여백
+    const cs = getComputedStyle(padFrom);
+    box.style.paddingLeft = cs.paddingLeft; box.style.paddingRight = cs.paddingRight;
+    const busy = st.busy.has(p.id), be = beState(p);
+    const html = FRACS.map(f => {
+      const v = closeVol(p, f);
+      return `<button data-ccpc="pct" data-f="${f}" ${!v || busy ? 'disabled' : ''}>${Math.round(f * 100)}%</button>`;
+    }).join('') + `<button data-ccpc="be" class="${be.done ? 'be-done' : ''}" ${!be.ok || busy ? 'disabled' : ''}>${be.done ? '본절✓' : '본절'}</button>`
+      + (be.ok || be.done ? '' : `<p class="ccpc-m-note">본절: ${esc(be.why)}</p>`);
+    if (box.__html !== html) { box.innerHTML = html; box.__html = html; }
+    box.dataset.id = p.id;
   }
 
-  function renderSheet() {
-    if (!sheet) return;
-    const p = st.open && st.open.find(x => x.id === sheetPos);
-    if (!p) { closeSheet(); return; }
-    const v = closeVol(p, sheetSel), pr = profitOf(p), est = pr == null || !v ? null : pr * v / p.volume;
-    const be = beState(p), busy = st.busy.has(p.id);
-    const html = `<div class="ccpc-sheet" role="dialog" aria-label="부분 청산"><span class="grab"></span>
-      <h3>${esc(name(p))} <span class="ccpc-chip ${isSell(p) ? 'sell' : 'buy'}">${sideKo(p)}</span> <span style="font-weight:400;font-size:14px;opacity:.7">${fmtVol(p, p.volume)} lot</span></h3>
-      <div class="ccpc-pcts">${FRACS.map(f => { const x = closeVol(p, f); return `<button data-f="${f}" class="${f === sheetSel ? 'on' : ''}" ${x ? '' : 'disabled'}>${Math.round(f * 100)}%<small>${x ? fmtVol(p, x) + ' lot' : '불가'}</small></button>`; }).join('')}</div>
-      <div class="ccpc-kv"><span>청산 수량</span><span>${v ? fmtVol(p, v) : '-'} lot</span>
-        <span>남는 수량</span><span>${v ? fmtVol(p, p.volume - v) : '-'} lot</span>
-        <span>진입가</span><span>${fmtPrice(p, p.openPrice)}</span>
-        <span>예상 실현 이익</span><span class="${est > 0 ? 'ccpc-up' : est < 0 ? 'ccpc-down' : ''}">약 ${money(est)}</span></div>
-      <button class="ccpc-big" data-k="go" ${v && !busy ? '' : 'disabled'}>${v ? fmtVol(p, v) + ' lot 청산하기' : '청산할 수 없어요'}</button>
-      <div class="ccpc-sub"><button data-k="be" ${be.ok && !busy ? '' : 'disabled'}>${be.done ? '본절 완료 ✓' : '본절 (손절 → 진입가)'}</button><button data-k="manual">직접 수량 입력</button></div>
-      ${be.ok || be.done ? '' : `<p class="ccpc-why">${esc(be.why)}</p>`}
-      <button class="ccpc-cancel" data-k="cancel">닫기</button></div>`;
-    if (sheet.__html !== html) { sheet.innerHTML = html; sheet.__html = html; }
+  function updateMobile() {
+    const detail = document.querySelector('mtr-position-details .mtr-open-position-details__buttons');
+    mobileBox('ccpc-m-detail', detail, detail, detail && findPos(detailId()));
+    // 사이트 부분 청산 창: PC는 표에 버튼이 있으므로 모바일 화면(<mtr-mobile>)에서만
+    const dlg = document.querySelector('trade-open-position-partial-close');
+    const mobile = !!document.querySelector('mtr-mobile');
+    const stepper = mobile && dlg && dlg.querySelector(':scope > .trade-open-position-partial-close__stepper-container');
+    const btns = stepper && dlg.querySelector(':scope > .trade-open-position-partial-close__buttons-container');
+    // 우리 버튼으로 청산하면 사이트 창은 필요 없으므로 닫음
+    const closeDlg = () => { const c = document.querySelector('[data-testid="open-position-partial-close-cancel-button"]'); if (c) c.click(); };
+    mobileBox('ccpc-m-dialog', stepper, btns || stepper, stepper && findPos(pencilPosId), closeDlg);
   }
 
   // ---------------------------------------------------------------- 갱신
   function update() {
     if (!document.body) return;
-    const visible = document.querySelector('trade-open-positions-desktop, trade-open-positions-mobile') || sheet;
-    if (visible) { loadInst(); loadOpen(); }
+    if (pop || document.querySelector('trade-open-positions-desktop, trade-open-positions-mobile, mtr-position-details')) { loadInst(); loadOpen(); }
     updatePC();
-    renderSheet();
+    updateMobile();
+    refreshPop();
   }
 
   function boot() {
@@ -467,7 +501,7 @@ function ccpcMain() {
     setInterval(update, 1000);
     let pending = false;
     // 사이트가 표의 칸 폭(style)을 다시 쓰면 바로 넓혀야 하므로 그 두 곳의 style 변경도 지켜봄
-    const ours = '.ccpc, .ccpc-h, .ccpc-pop, .ccpc-bg, .ccpc-toast';
+    const ours = '.ccpc, .ccpc-h, .ccpc-m, .ccpc-pop, .ccpc-toast';
     const relevant = m => m.type === 'attributes'
       ? m.target.matches('.ui-list-row__content, .ui-list-header__content')
       : !(m.target.closest && m.target.closest(ours));
@@ -484,6 +518,7 @@ function ccpcMain() {
 // 사이트의 XHR을 엿볼 수 없으므로 항상 코드를 페이지에 직접 넣어 실행한다.
 // (이 사이트는 CSP가 없어 인라인 스크립트가 막히지 않고, 크롬처럼 원래 페이지에서 실행되는 경우에도 똑같이 동작한다)
 (function inject() {
+  if (window.top !== window.self) return;  // 차트 프레임에서는 실행하지 않음
   const root = document.head || document.documentElement;
   if (!root) {  // 아주 이른 시점이라 <html>도 아직 없으면 생길 때까지 기다림
     new MutationObserver(function (m, o) { if (document.documentElement) { o.disconnect(); inject(); } })
