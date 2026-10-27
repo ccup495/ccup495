@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Culture Capital 잔고 원화 표시
 // @namespace    https://mtr.culturecapitalllc.com/
-// @version      1.6.2
+// @version      1.6.4
 // @description  상단 잔고(USD)와 오픈 포지션·청산 포지션·재무의 금액에 네이버 환율(하나은행 매매기준율) 기준 원화 금액을 표시합니다. 모바일은 포트폴리오(시가·청산됨), 거래 화면 종목 손익 칩, 더보기 > 재무(Finance History)도 표시합니다.
 // @match        *://*.culturecapitalllc.com/*
 // @match        *://culturecapitalllc.com/*
@@ -112,14 +112,17 @@
   // ---------- 잔고 찾기 ----------
 
   // "410.14 USD", "6 130 USD", "-12.50USD" 같은 텍스트
-  const USD_RX = /^([-−+]?)\s*\$?\s*([\d][\d.,\s  ]*)\s*USD$/;
-  const NUM_RX = /^([-−+]?)\s*\$?\s*([\d][\d.,\s  ]*)$/;
+  // 모바일은 큰 금액을 "2.11k", "-1.5M"처럼 줄여 쓰므로 끝의 k/M/B도 받음
+  const USD_RX = /^([-−+]?)\s*\$?\s*([\d][\d.,\s  ]*?)\s*([kKmMbB])?\s*USD$/;
+  const NUM_RX = /^([-−+]?)\s*\$?\s*([\d][\d.,\s  ]*?)\s*([kKmMbB])?$/;
+  const SUFFIX = { k: 1e3, m: 1e6, b: 1e9 };
 
   function parseWith(rx, text) {
     const m = text.replace(/\s+/g, ' ').trim().match(rx);
     if (!m) return null;
-    const num = parseFloat(m[2].replace(/[,\s  ]/g, ''));
+    let num = parseFloat(m[2].replace(/[,\s  ]/g, ''));
     if (isNaN(num)) return null;
+    if (m[3]) num *= SUFFIX[m[3].toLowerCase()];
     return m[1] === '-' || m[1] === '−' ? -num : num;
   }
 
@@ -237,7 +240,9 @@
     .krw-cell{font-size:11px;line-height:13px;opacity:.7;white-space:nowrap;font-weight:400}
     .krw-inline{opacity:.75;white-space:nowrap}
     .krw-m{font-size:11px;font-weight:400;opacity:.75;white-space:nowrap;margin-left:4px}
-    .krw-m-block{display:block;margin-left:0;line-height:13px}`;
+    .krw-m-block{display:block;margin-left:0;line-height:13px}
+    .krw-watch-line{display:flex!important;align-items:baseline;gap:5px;white-space:nowrap;overflow:hidden}
+    .krw-watch-line > .krw-watch{margin-left:0;flex-shrink:0}`;
 
   // 셀 글자에서 우리가 붙인 원화 표시는 빼고 읽음
   function ownText(el) {
@@ -374,16 +379,28 @@
     tag.title = `${usd} USD × ${rate.toLocaleString('ko-KR')}원\n${rateInfo}`;
   }
 
-  // 거래 화면 종목 손익 칩(-3.73)은 옆에 붙이면 가격 칸을 가리므로, 아래 "스프레드" 줄 끝에 원화를 붙임
+  // 칸이 좁을 때 쓰는 짧은 원화 표기: 3,326,001 → 333만원, 152,000,000 → 1.5억원
+  function shortKrw(krw) {
+    const a = Math.abs(krw), sign = krw < 0 ? '-' : '';
+    if (a >= 1e8) return sign + (a / 1e8).toFixed(a >= 1e9 ? 0 : 1).replace(/\.0$/, '') + '억원';
+    if (a >= 1e4) return sign + Math.round(a / 1e4).toLocaleString('ko-KR') + '만원';
+    return formatKrw(krw);
+  }
+
+  // 거래 화면 종목 손익 칩(-3.73)은 옆에 붙이면 가격 칸을 가리므로, 아래 "스프레드" 줄의 스프레드 바로 옆에 원화를 붙임
+  // (스프레드가 한 줄을 다 차지하는 블록이라 줄을 가로 배치로 바꾸고, 칸을 넘치면 짧은 표기로 바꿈)
   function putChip(chip) {
     const usd = parseWith(NUM_RX, chip.textContent);
     const symbol = chip.closest('trade-instrument-symbol');
     const line = symbol && symbol.querySelector('[data-testid="additional-data"]');
     if (!line) return;
     let tag = line.querySelector(':scope > .krw-watch');
-    if (usd === null) { if (tag) tag.remove(); return; }
+    if (usd === null) { if (tag) tag.remove(); line.classList.remove('krw-watch-line'); return; }
     if (!tag) { tag = document.createElement('span'); tag.className = 'krw-m krw-watch'; line.appendChild(tag); }
-    const text = '≈ ' + formatKrw(usd * rate);
+    line.classList.add('krw-watch-line');
+    let text = '≈ ' + formatKrw(usd * rate);
+    if (tag.textContent !== text) tag.textContent = text;
+    if (line.scrollWidth > line.clientWidth + 1) text = '≈ ' + shortKrw(usd * rate);
     if (tag.textContent !== text) tag.textContent = text;
     tag.style.color = usd < 0 ? 'var(--content-error)' : usd > 0 ? 'var(--content-success)' : '';
     tag.title = `${usd} USD × ${rate.toLocaleString('ko-KR')}원\n${rateInfo}`;
@@ -403,7 +420,7 @@
     for (const chip of document.querySelectorAll('trade-market-watch [data-testid="profit-badge"]')) putChip(chip);
     for (const t of document.querySelectorAll('.krw-watch')) {  // 포지션을 닫아 칩이 사라지면 원화도 정리
       const symbol = t.closest('trade-instrument-symbol');
-      if (!symbol || !symbol.querySelector('[data-testid="profit-badge"]')) t.remove();
+      if (!symbol || !symbol.querySelector('[data-testid="profit-badge"]')) { t.parentElement.classList.remove('krw-watch-line'); t.remove(); }
     }
   }
 
