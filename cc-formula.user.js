@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Culture Capital 수식관리자·조건검색
 // @namespace    rere
-// @version      1.0.1
+// @version      1.1.0
 // @description  키움 영웅문 스타일 수식관리자(기술적지표·신호검색·시스템트레이딩·강세약세·사용자함수)와 조건검색을 트레이딩뷰 차트에 추가합니다.
 // @match        https://mtr.culturecapitalllc.com/*
 // @run-at       document-start
@@ -26,9 +26,10 @@ function ccfMain() {
     'use strict';
 
     class FormulaError extends Error {
-      constructor(msg, line) {
+      constructor(msg, line, info) {
         super(line ? msg + ' (줄 ' + line + ')' : msg);
         this.line = line;
+        this.info = info || null; // 자동수정용: { code, pos, ... }
       }
     }
 
@@ -47,7 +48,7 @@ function ccfMain() {
       const n = src.length;
       while (i < n) {
         const ch = src[i];
-        if (ch === '\n') { toks.push({ t: 'nl', line: line }); line++; i++; continue; }
+        if (ch === '\n') { toks.push({ t: 'nl', line: line, pos: i, end: i + 1 }); line++; i++; continue; }
         if (ch === ' ' || ch === '\t' || ch === '\r' || ch === ' ' || ch === '　') { i++; continue; }
         if (ch === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; continue; }
         if (ch === '/' && src[i + 1] === '*') {
@@ -59,12 +60,12 @@ function ccfMain() {
         if (/[0-9.]/.test(ch)) {
           NUM_RE.lastIndex = i;
           const m = NUM_RE.exec(src);
-          if (m) { toks.push({ t: 'num', v: parseFloat(m[0]), line: line }); i += m[0].length; continue; }
+          if (m) { toks.push({ t: 'num', v: parseFloat(m[0]), line: line, pos: i, end: i + m[0].length }); i += m[0].length; continue; }
         }
         if (ch === '"' || ch === "'") {
           const e = src.indexOf(ch, i + 1);
-          if (e < 0) throw new FormulaError('따옴표가 닫히지 않았습니다', line);
-          toks.push({ t: 'str', v: src.slice(i + 1, e), line: line });
+          if (e < 0) throw new FormulaError('따옴표가 닫히지 않았습니다', line, { code: 'quote', pos: i });
+          toks.push({ t: 'str', v: src.slice(i + 1, e), line: line, pos: i, end: e + 1 });
           i = e + 1; continue;
         }
         if (ID_START.test(ch)) {
@@ -72,19 +73,21 @@ function ccfMain() {
           while (j < n && ID_PART.test(src[j])) j++;
           const word = src.slice(i, j);
           const low = word.toLowerCase();
-          if (WORD_OPS[low]) toks.push({ t: 'op', v: WORD_OPS[low], line: line });
-          else if (low === 'true' || low === '참') toks.push({ t: 'num', v: 1, line: line });
-          else if (low === 'false' || low === '거짓') toks.push({ t: 'num', v: 0, line: line });
-          else toks.push({ t: 'id', v: word, line: line });
+          const tk = { line: line, pos: i, end: j };
+          if (WORD_OPS[low]) { tk.t = 'op'; tk.v = WORD_OPS[low]; }
+          else if (low === 'true' || low === '참') { tk.t = 'num'; tk.v = 1; }
+          else if (low === 'false' || low === '거짓') { tk.t = 'num'; tk.v = 0; }
+          else { tk.t = 'id'; tk.v = word; }
+          toks.push(tk);
           i = j; continue;
         }
         let op = null;
         for (const o of OPS) if (src.startsWith(o, i)) { op = o; break; }
-        if (!op) throw new FormulaError('알 수 없는 문자: ' + ch, line);
-        toks.push({ t: 'op', v: op === '<>' ? '!=' : op, line: line });
+        if (!op) throw new FormulaError('알 수 없는 문자: ' + ch, line, { code: 'char', pos: i, ch: ch });
+        toks.push({ t: 'op', v: op === '<>' ? '!=' : op, line: line, pos: i, end: i + op.length });
         i += op.length;
       }
-      toks.push({ t: 'eof', line: line });
+      toks.push({ t: 'eof', line: line, pos: n, end: n });
       return toks;
     }
 
@@ -96,21 +99,23 @@ function ccfMain() {
 
     function parse(src) {
       const toks = lex(src);
-      let p = 0, depth = 0;
+      let p = 0, depth = 0, lastEnd = 0;
+      const ctxStack = []; // 'call' | 'group'
 
       function peek() {
         // 괄호 안에서는 줄바꿈 무시
         if (depth > 0) while (toks[p].t === 'nl') p++;
         return toks[p];
       }
-      function next() { const t = peek(); p++; return t; }
+      function next() { const t = peek(); p++; lastEnd = t.end; return t; }
       function skipNl() { while (toks[p].t === 'nl') p++; }
       function isOp(t, v) { return t.t === 'op' && t.v === v; }
       function expectOp(v) {
         const t = next();
-        if (!isOp(t, v)) throw new FormulaError("'" + v + "'가 필요합니다" + desc(t), t.line);
+        if (!isOp(t, v)) throw new FormulaError("'" + v + "'가 필요합니다" + desc(t), t.line, { code: 'expect', want: v, pos: t.pos, after: lastPrev(t), ctx: ctxStack[ctxStack.length - 1] });
         return t;
       }
+      function lastPrev(t) { let q = toks.indexOf(t) - 1; while (q >= 0 && toks[q].t === 'nl') q--; return q >= 0 ? toks[q].end : 0; }
       function desc(t) {
         if (t.t === 'eof') return ' (수식이 끝남)';
         if (t.t === 'nl') return ' (줄바꿈)';
@@ -137,9 +142,9 @@ function ccfMain() {
           const t = toks[p];
           if (t.t === 'eof') break;
           if (t.t === 'nl' || isOp(t, ';')) continue;
-          throw new FormulaError("문장 사이에 ';' 또는 줄바꿈이 필요합니다" + desc(t), t.line);
+          throw new FormulaError("문장 사이에 ';' 또는 줄바꿈이 필요합니다" + desc(t), t.line, { code: 'sep', pos: t.pos });
         }
-        if (!stmts.length) throw new FormulaError('수식이 비어 있습니다', 1);
+        if (!stmts.length) throw new FormulaError('수식이 비어 있습니다', 1, { code: 'empty', pos: 0 });
         return stmts;
       }
       function parseStatement() {
@@ -147,9 +152,11 @@ function ccfMain() {
         if (t.t === 'id' && isOp(t2, '=')) {
           p += 2;
           skipNl();
-          return { k: 'assign', name: t.v, expr: parseExpr(), line: t.line };
+          const ex = parseExpr();
+          return { k: 'assign', name: t.v, expr: ex, line: t.line, s: t.pos, nameEnd: t.end, e: lastEnd };
         }
-        return { k: 'expr', expr: parseExpr(), line: t.line };
+        const ex = parseExpr();
+        return { k: 'expr', expr: ex, line: t.line, s: t.pos, e: lastEnd };
       }
       function parseExpr() { return parseOr(); }
       function bin(sub, ops) {
@@ -158,37 +165,37 @@ function ccfMain() {
           for (;;) {
             const t = peekBin();
             if (t.t === 'op' && ops.indexOf(t.v) >= 0) {
-              p++; skipNl();
+              p++; lastEnd = t.end; skipNl();
               const b = sub();
-              a = { k: 'bin', op: t.v === '=' ? '==' : t.v, a: a, b: b, line: t.line };
+              a = { k: 'bin', op: t.v === '=' ? '==' : t.v, a: a, b: b, line: t.line, s: a.s, e: lastEnd, opPos: t.pos, opEnd: t.end };
             } else return a;
           }
         };
       }
       function parseNot() {
         const t = peek();
-        if (isOp(t, '!')) { p++; skipNl(); return { k: 'un', op: '!', a: parseNot(), line: t.line }; }
+        if (isOp(t, '!')) { p++; lastEnd = t.end; skipNl(); const a = parseNot(); return { k: 'un', op: '!', a: a, line: t.line, s: t.pos, e: lastEnd }; }
         return parseEq();
       }
       function parseUnary() {
         const t = peek();
-        if (isOp(t, '-') || isOp(t, '+')) { p++; skipNl(); const a = parseUnary(); return t.v === '-' ? { k: 'un', op: '-', a: a, line: t.line } : a; }
-        if (isOp(t, '!')) { p++; skipNl(); return { k: 'un', op: '!', a: parseUnary(), line: t.line }; }
+        if (isOp(t, '-') || isOp(t, '+')) { p++; lastEnd = t.end; skipNl(); const a = parseUnary(); return t.v === '-' ? { k: 'un', op: '-', a: a, line: t.line, s: t.pos, e: lastEnd } : a; }
+        if (isOp(t, '!')) { p++; lastEnd = t.end; skipNl(); const a = parseUnary(); return { k: 'un', op: '!', a: a, line: t.line, s: t.pos, e: lastEnd }; }
         return parsePow();
       }
       function parsePow() {
         const a = parsePrimary();
         const t = peekBin();
-        if (isOp(t, '^')) { p++; skipNl(); return { k: 'bin', op: '^', a: a, b: parseUnary(), line: t.line }; }
+        if (isOp(t, '^')) { p++; lastEnd = t.end; skipNl(); const b = parseUnary(); return { k: 'bin', op: '^', a: a, b: b, line: t.line, s: a.s, e: lastEnd, opPos: t.pos, opEnd: t.end }; }
         return a;
       }
       function parsePrimary() {
         const t = next();
-        if (t.t === 'num') return { k: 'num', v: t.v, line: t.line };
-        if (t.t === 'str') return { k: 'str', v: t.v, line: t.line };
+        if (t.t === 'num') return { k: 'num', v: t.v, line: t.line, s: t.pos, e: t.end };
+        if (t.t === 'str') return { k: 'str', v: t.v, line: t.line, s: t.pos, e: t.end };
         if (t.t === 'id') {
           if (isOp(toks[p], '(')) {
-            p++; depth++;
+            p++; lastEnd = toks[p - 1].end; depth++; ctxStack.push('call');
             const args = [];
             if (!isOp(peek(), ')')) {
               for (;;) {
@@ -197,18 +204,18 @@ function ccfMain() {
                 break;
               }
             }
-            expectOp(')'); depth--;
-            return { k: 'call', name: t.v, args: args, line: t.line };
+            expectOp(')'); depth--; ctxStack.pop();
+            return { k: 'call', name: t.v, args: args, line: t.line, s: t.pos, nameEnd: t.end, e: lastEnd };
           }
-          return { k: 'id', name: t.v, line: t.line };
+          return { k: 'id', name: t.v, line: t.line, s: t.pos, e: t.end };
         }
         if (isOp(t, '(')) {
-          depth++;
+          depth++; ctxStack.push('group');
           const e = parseExpr();
-          expectOp(')'); depth--;
-          return e;
+          expectOp(')'); depth--; ctxStack.pop();
+          return Object.assign({}, e, { s: t.pos, e: lastEnd, paren: true });
         }
-        throw new FormulaError('값이 필요합니다' + desc(t), t.line);
+        throw new FormulaError('값이 필요합니다' + desc(t), t.line, { code: 'value', pos: t.pos });
       }
       const parseMul = bin(parseUnary, ['*', '/', '%']);
       const parseAdd = bin(parseMul, ['+', '-']);
@@ -689,7 +696,7 @@ function ccfMain() {
         for (const s of stmts) {
           if (s.k === 'assign') {
             const k = key(s.name);
-            if (DATA[k] || SPECIAL_DATA[k]) throw new FormulaError("'" + s.name + "'은(는) 가격 데이터 이름이라 변수로 쓸 수 없습니다", s.line);
+            if (DATA[k] || SPECIAL_DATA[k]) throw new FormulaError("'" + s.name + "'은(는) 가격 데이터 이름이라 변수로 쓸 수 없습니다", s.line, { code: 'datavar', pos: s.s, stmtEnd: s.e, name: s.name });
             const holder = fwd[k];
             const inner = Object.create(scope);
             const before = lookup(scope, s.name);
@@ -744,7 +751,7 @@ function ccfMain() {
         if (b) {
           if (b.self) {
             // 자기 자신 참조: 과거 값만 가능
-            if (!lagNode || (lagNode.isConst && lagNode.value < 1)) throw new FormulaError("변수 '" + e.name + "'은(는) 정의되기 전이나 자기 식 안에서는 " + e.name + '(1)처럼 과거 값으로만 쓸 수 있습니다', e.line);
+            if (!lagNode || (lagNode.isConst && lagNode.value < 1)) throw new FormulaError("변수 '" + e.name + "'은(는) 정의되기 전이나 자기 식 안에서는 " + e.name + '(1)처럼 과거 값으로만 쓸 수 있습니다', e.line, { code: 'selfref', pos: e.s, end: e.e, name: e.name });
             const holder = b.self;
             return exprNode(function (i) { const k2 = Math.round(lagNode.ev(i)); return k2 >= 1 ? holder.target.get(i, k2) : NaN; });
           }
@@ -756,7 +763,7 @@ function ccfMain() {
         else if (!lagNode && (B[k] || funcs[k])) {
           // 인자 없는 함수를 괄호 없이 쓴 경우 (예: DayOpen, OBV)
           return compileCall({ k: 'call', name: e.name, args: [], line: e.line }, scope);
-        } else throw new FormulaError("알 수 없는 이름: '" + e.name + "' (지표변수라면 변수 목록에 추가하세요)", e.line);
+        } else throw new FormulaError("알 수 없는 이름: '" + e.name + "' (지표변수라면 변수 목록에 추가하세요)", e.line, { code: 'unkname', pos: e.s, end: e.s + e.name.length, name: e.name, lagged: !!lagNode });
         if (!lagNode) return refNode(base);
         if (lagNode.isConst) {
           const kk = Math.round(lagNode.value);
@@ -770,9 +777,9 @@ function ccfMain() {
         // 과거값 참조: C(1), A(2) — 변수/데이터 이름 뒤 괄호 하나
         const b = lookup(scope, e.name);
         if (b || DATA[k] || SPECIAL_DATA[k] || (k in vars)) {
-          if (e.args.length !== 1) throw new FormulaError("'" + e.name + "(N)'은 N봉 전 값입니다. 괄호 안에 숫자 하나만 넣으세요", e.line);
+          if (e.args.length !== 1) throw new FormulaError("'" + e.name + "(N)'은 N봉 전 값입니다. 괄호 안에 숫자 하나만 넣으세요", e.line, { code: 'lagargs', pos: e.s, end: e.e, name: e.name, call: e });
           const lag = compileExpr(e.args[0], scope);
-          return compileId({ k: 'id', name: e.name, line: e.line }, scope, lag);
+          return compileId({ k: 'id', name: e.name, line: e.line, s: e.s, e: e.e }, scope, lag);
         }
         const uf = funcs[k];
         if (uf && uf[e.args.length] && (uf[e.args.length].user || !B[k] || !arityOk(B[k], e.args.length))) {
@@ -780,12 +787,12 @@ function ccfMain() {
         }
         const spec = B[k];
         if (spec) {
-          if (!arityOk(spec, e.args.length)) throw new FormulaError(e.name + ' 함수의 인자 수가 맞지 않습니다 (' + (spec.min === spec.max ? spec.min : spec.min + '~' + spec.max) + '개 필요)', e.line);
+          if (!arityOk(spec, e.args.length)) throw new FormulaError(e.name + ' 함수의 인자 수가 맞지 않습니다 (' + (spec.min === spec.max ? spec.min : spec.min + '~' + spec.max) + '개 필요)', e.line, { code: 'arity', pos: e.s, end: e.e, name: e.name, call: e, min: spec.min, max: spec.max, alts: uf ? Object.keys(uf).map(Number) : [] });
           const args = e.args.map(function (ae, idx) {
             if (spec.raw && spec.raw.indexOf(idx) >= 0) {
               const name = ae.k === 'id' || ae.k === 'str' ? (ae.name || ae.v) : (ae.k === 'num' ? String(ae.v) : null);
               const t = name !== null ? MA_TYPES[key(name)] : undefined;
-              if (t === undefined) throw new FormulaError('이평 종류는 단순/지수/가중/윌더 중 하나여야 합니다', ae.line);
+              if (t === undefined) throw new FormulaError('이평 종류는 단순/지수/가중/윌더 중 하나여야 합니다', ae.line, { code: 'matype', pos: ae.s, end: ae.e, word: name });
               return constNode(t);
             }
             return compileExpr(ae, scope);
@@ -794,9 +801,9 @@ function ccfMain() {
         }
         if (uf) {
           const ar = Object.keys(uf).join(' 또는 ');
-          throw new FormulaError(e.name + ' 함수의 인자 수가 맞지 않습니다 (' + ar + '개 필요)', e.line);
+          throw new FormulaError(e.name + ' 함수의 인자 수가 맞지 않습니다 (' + ar + '개 필요)', e.line, { code: 'arity', pos: e.s, end: e.e, name: e.name, call: e, alts: Object.keys(uf).map(Number) });
         }
-        throw new FormulaError("알 수 없는 함수: '" + e.name + "'", e.line);
+        throw new FormulaError("알 수 없는 함수: '" + e.name + "'", e.line, { code: 'unkfunc', pos: e.s, end: e.nameEnd, name: e.name, call: e });
       }
       function arityOk(spec, n) { return n >= spec.min && n <= spec.max; }
 
@@ -824,10 +831,10 @@ function ccfMain() {
       }
 
       function inlineFunc(fd, e, scope) {
-        if (++depth > 30) throw new FormulaError('함수 호출이 너무 깊습니다 (재귀 호출 확인): ' + e.name, e.line);
+        if (++depth > 30) throw new FormulaError('함수 호출이 너무 깊습니다 (재귀 호출 확인): ' + e.name, e.line, { code: 'inner', pos: e.s });
         try {
           if (!fd.stmts) {
-            try { fd.stmts = parse(fd.src); } catch (err) { throw new FormulaError('함수 ' + fd.name + ' 수식 오류: ' + err.message, e.line); }
+            try { fd.stmts = parse(fd.src); } catch (err) { throw new FormulaError('함수 ' + fd.name + ' 수식 오류: ' + err.message, e.line, { code: 'inner', pos: e.s, func: fd.name, user: fd.user }); }
           }
           const args = e.args.map(function (ae) { return materialize(compileExpr(ae, scope)); });
           // 함수 본문은 호출한 쪽 변수를 보지 못하고, 인자와 지표변수만 본다
@@ -835,8 +842,9 @@ function ccfMain() {
           fd.params.forEach(function (pn, idx) { inner[key(pn)] = { node: args[idx] }; });
           let block;
           try { block = compileBlock(fd.stmts, inner); } catch (err) {
-            if (fd.user) throw new FormulaError('사용자함수 ' + fd.name + ': ' + err.message, e.line);
-            throw err;
+            // 함수 본문 안의 위치는 지금 수식의 위치가 아니므로 자동수정 정보는 바꿔 둔다
+            if (fd.user) throw new FormulaError('사용자함수 ' + fd.name + ': ' + err.message, e.line, { code: 'inner', pos: e.s, func: fd.name, user: true });
+            throw new FormulaError(err.message, e.line, { code: 'inner', pos: e.s, func: fd.name });
           }
           const order = block.order, result = block.result;
           const buf = [];
@@ -948,6 +956,471 @@ function ccfMain() {
       return out;
     }
 
+    // ---------------------------------------------------------------------------
+    // 11. 자동수정
+    //   1) 전각 기호, 다른 프로그램 문법(트레이딩뷰 ta.xxx, close[1], a ? b : c 등)을 먼저 바꾸고
+    //   2) 컴파일 오류가 날 때마다 오류 위치를 보고 고칠 후보를 만들어 하나씩 시험한다.
+    //      후보를 넣었을 때 오류가 없어지거나 더 뒤로 밀려나야 채택한다.
+    //   3) 문법이 맞으면 흔한 실수(RSI(C)처럼 기간 자리에 가격 넣기 등)를 한 번 더 고친다.
+    // ---------------------------------------------------------------------------
+    const CANON = {};
+    ['avg', 'eavg', 'wavg', 'rma', 'ma', 'stdev', 'meandev', 'highest', 'lowest', 'highestbars', 'lowestbars', 'LinReg', 'LinRegSlope', 'sum',
+      'max', 'min', 'abs', 'log', 'log10', 'exp', 'sqrt', 'pow', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'round', 'floor', 'ceil', 'nz', 'isnan',
+      'if', 'between', 'CrossUp', 'CrossDown', 'shift', 'BarsSince', 'CountSince', 'HighestSince', 'LowestSince', 'ValueWhen', 'TrueRange',
+      'DayOpen', 'DayHigh', 'DayLow', 'PredayOpen', 'PredayHigh', 'PredayLow', 'PredayClose', 'SAR'].forEach(function (n) { CANON[n.toLowerCase()] = n; });
+    // 첫 인자가 데이터(가격)인 통계 함수와 그 기본값
+    const SERIES_FN = { avg: 20, 평균: 20, sma: 20, wavg: 20, 가중평균: 20, wma: 20, eavg: 20, 지수평균: 20, ema: 20, rma: 14, 윌더평균: 14, smma: 14,
+      ma: 20, 이평: 20, stdev: 20, 표준편차: 20, meandev: 20, 평균편차: 20, highest: 20, 최고값: 20, lowest: 20, 최저값: 20, highestbars: 20, lowestbars: 20,
+      linreg: 20, 선형회귀: 20, linregslope: 20, 회귀기울기: 20, sum: 20, 합계: 20 };
+    const SERIES_DEFAULT_DATA = { highest: 'H', 최고값: 'H', highestbars: 'H', lowest: 'L', 최저값: 'L', lowestbars: 'L' };
+    // 내장 지표 함수를 인자 없이/모자라게 썼을 때 채울 기본값
+    const FN_DEFAULTS = {
+      rsi: [14], macd: [12, 26], macdsignal: [12, 26, 9], macdosc: [12, 26, 9], stochasticsfast: [5], stochasticsk: [5, 3], stochasticsd: [5, 3, 3],
+      cci: [20], atr: [14], diplus: [14], diminus: [14], adx: [14], mfi: [14], momentum: [10], roc: [12], disparity: [20], 이격도: [20], williamsr: [14],
+      bbandsup: [20, 2], bbandsdown: [20, 2], bbandswidth: [20, 2], bbandsb: [20, 2], bbandsmid: [20], envelopeup: [20, 5], envelopedown: [20, 5],
+      trix: [12], vr: [20], psychological: [10], 심리도: [10], 전환선: [9], 기준선: [26], 선행스팬1: [9, 26, 26], 선행스팬2: [52, 26],
+      supertrend: [10, 3], supertrenddir: [10, 3], stochrsi: [14, 3], cmo: [14], ultimateosc: [7, 14, 28], aroonup: [25], aroondown: [25], aroonosc: [25],
+      dpo: [20], forceindex: [13], eom: [14], elderbull: [13], elderbear: [13], chaikinosc: [3, 10], keltnerup: [20, 2], keltnerdown: [20, 2],
+      donchianup: [20], donchiandown: [20], volumeosc: [5, 20], sar: [0.02, 0.2],
+    };
+    // 다른 프로그램(트레이딩뷰·에이미브로커·엑셀 등)에서 쓰는 함수 이름
+    const FN_ALIAS = {
+      crossover: 'CrossUp', crossunder: 'CrossDown', cross: 'CrossUp', 골든크로스: 'CrossUp', 데드크로스: 'CrossDown', 돌파: 'CrossUp', 상승돌파: 'CrossUp', 하락돌파: 'CrossDown',
+      iif: 'if', ifelse: 'if', iff: 'if', average: 'avg', mean: 'avg', 이동평균: 'avg', 단순이평: 'avg', 지수이평: 'eavg', 지수이동평균: 'eavg', 가중이평: 'wavg',
+      hhv: 'highest', llv: 'lowest', hhvbars: 'highestbars', llvbars: 'lowestbars', stddev: 'stdev', std: 'stdev', dev: 'meandev',
+      stoch: 'StochasticsK', stochastic: 'StochasticsK', stochk: 'StochasticsK', stochd: 'StochasticsD', bbup: 'BBandsUp', bbupper: 'BBandsUp', bbdn: 'BBandsDown',
+      bblower: 'BBandsDown', bbdown: 'BBandsDown', bbmid: 'BBandsMid', bbwidth: 'BBandsWidth', macdsig: 'MACDSignal', macdhist: 'MACDOsc', macdhistogram: 'MACDOsc',
+      supertrendline: 'SuperTrend', psar: 'SAR', parabolicsar: 'SAR', willr: 'WilliamsR', wpr: 'WilliamsR', mom: 'Momentum', obvline: 'OBV', dmi: 'ADX',
+      valuewhen: 'ValueWhen', barssince: 'BarsSince', absolute: 'abs', nan: 'isnan', isna: 'isnan', na: 'isnan', 반올림: 'round',
+    };
+    // 다른 프로그램에서 쓰는 데이터 이름 → 이 수식 문법
+    const ID_ALIAS = {
+      hl2: '(H + L) / 2', hlc3: '(H + L + C) / 3', ohlc4: '(O + H + L + C) / 4', hlcc4: '(H + L + C + C) / 4', bar_index: 'BarIndex', barnumber: 'BarIndex',
+      price: 'C', 현재가: 'C', 가격: 'C', closeprice: 'C', vol: 'V', 체결량: 'V', 틱거래량: 'V', 저점: 'L', 고점: 'H', openprice: 'O', 시초가: 'O',
+    };
+    const MA_WORDS = [[/^(s|sma|simple|단|기본|산술|단순이평|단순평균)$/i, '단순'], [/^(e|ema|exp|expo|exponential|지|지수이평|지수평균)$/i, '지수'],
+      [/^(w|wma|weight|weighted|가|가중이평|가중평균)$/i, '가중'], [/^(r|rma|smma|wilder|윌|수정|윌더평균)$/i, '윌더']];
+
+    // 받침에 맞춰 을/를
+    function eul(w) {
+      w = String(w);
+      const ch = w.charCodeAt(w.length - 1);
+      let bat;
+      if (ch >= 0xAC00 && ch <= 0xD7A3) bat = (ch - 0xAC00) % 28 !== 0;
+      else bat = /[013678lmn]$/i.test(w);
+      return "'" + w + "'" + (bat ? '을' : '를');
+    }
+    function lev(a, b) {
+      if (a === b) return 0;
+      const m = a.length, n = b.length;
+      if (!m || !n) return m || n;
+      let prev = new Array(n + 1), cur = new Array(n + 1);
+      for (let j = 0; j <= n; j++) prev[j] = j;
+      for (let i = 1; i <= m; i++) {
+        cur[0] = i;
+        for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        const t = prev; prev = cur; cur = t;
+      }
+      return prev[n];
+    }
+    // 오타 고치기: 가장 가까운 이름 (너무 짧거나 멀면 null)
+    function closest(word, names) {
+      const w = word.toLowerCase();
+      const L = w.length;
+      const hangul = /[가-힣]/.test(w);
+      const lim = hangul ? (L <= 3 ? 0 : 1) : L <= 2 ? 0 : L <= 4 ? 1 : L <= 8 ? 2 : 3;
+      const strip = function (x) { return x.replace(/[0-9]/g, ''); };
+      let best = null, bd = Infinity;
+      names.forEach(function (n) {
+        // 이평2 → 이평3 처럼 숫자만 다른 이름은 다른 변수로 본다
+        if (strip(n.toLowerCase()) === strip(w)) return;
+        const d = lev(w, n.toLowerCase());
+        if (d < bd || (d === bd && best && Math.abs(n.length - L) < Math.abs(best.length - L))) { bd = d; best = n; }
+      });
+      return best && bd <= lim && bd > 0 ? best : null;
+    }
+    function lineOf(src, pos) { let n = 1; for (let i = 0; i < pos && i < src.length; i++) if (src[i] === '\n') n++; return n; }
+    function lineText(src, line) { return (src.split('\n')[line - 1] || '').trim(); }
+    function splice(src, a, b, txt) { return src.slice(0, a) + txt + src.slice(b); }
+    function isValueStart(t) { return t && (t.t === 'num' || t.t === 'id' || t.t === 'str' || (t.t === 'op' && (t.v === '(' || t.v === '!'))); }
+    const BIN_OPS = new Set(['||', '&&', '==', '!=', '<', '<=', '>', '>=', '+', '-', '*', '/', '%', '^', '=']);
+    function guessVarValue(name) {
+      const n = name.toLowerCase();
+      if (/단기|short|fast|빠른/.test(n)) return 5;
+      if (/중기|mid/.test(n)) return 20;
+      if (/장기|long|slow|느린/.test(n)) return 60;
+      if (/시그널|signal|sig/.test(n)) return 9;
+      if (/과열|과매수|overbought|상한|upper/.test(n)) return 70;
+      if (/침체|과매도|oversold|하한|lower/.test(n)) return 30;
+      if (/배수|승수|mult|factor|^k$|^d$/.test(n)) return 2;
+      return 14;
+    }
+    // 수식 안에서 대입하는 변수 이름 (구문이 맞을 때만)
+    function assignedNames(src) {
+      try { return parse(src).filter(function (s) { return s.k === 'assign'; }).map(function (s) { return s.name; }); } catch (e) { return []; }
+    }
+    function wordsIn(src) {
+      const out = new Set();
+      try { lex(src).forEach(function (t) { if (t.t === 'id') out.add(t.v.toLowerCase()); }); } catch (e) { /* 무시 */ }
+      return out;
+    }
+
+    // 1단계: 글자 단위로 확실한 것부터 바꾼다
+    function normalizeSrc(src) {
+      const notes = [];
+      let s = src;
+      function sub(re, to, why) {
+        const before = s;
+        s = s.replace(re, to);
+        if (s !== before) notes.push(why);
+      }
+      sub(/[０-９Ａ-Ｚａ-ｚ]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); }, '전각(넓은) 영문·숫자를 일반 글자로 바꿨어요');
+      const SYM = { '（': '(', '）': ')', '，': ',', '、': ',', '；': ';', '＝': '=', '＜': '<', '＞': '>', '＋': '+', '－': '-', '−': '-', '–': '-', '—': '-',
+        '＊': '*', '×': '*', '／': '/', '÷': '/', '≥': '>=', '≤': '<=', '≠': '!=', '“': '"', '”': '"', '‘': "'", '’': "'", '．': '.', '％': '%', '＾': '^', '！': '!', '｜': '|', '＆': '&' };
+      sub(/[（），、；＝＜＞＋－−–—＊×／÷≥≤≠“”‘’．％＾！｜＆]/g, function (c) { return SYM[c]; }, '전각·특수 기호(（ ） × ÷ ≥ 등)를 일반 기호로 바꿨어요');
+      sub(/=>/g, '>=', "'=>'를 '>='(크거나 같다)로 바꿨어요");
+      sub(/=</g, '<=', "'=<'를 '<='(작거나 같다)로 바꿨어요");
+      sub(/(^|[^&])&(?!&)/g, '$1&&', "'&'를 '&&'(그리고)로 바꿨어요");
+      sub(/(^|[^|])\|(?!\|)/g, '$1||', "'|'를 '||'(또는)로 바꿨어요");
+      sub(/(^|[^A-Za-z0-9_가-힣])(ta|math|request|strategy)\.(?=[A-Za-z_])/gi, '$1', "트레이딩뷰식 'ta.' 같은 앞글자를 뺐어요");
+      sub(/([A-Za-z_가-힣][A-Za-z0-9_가-힣]*)\s*\[\s*([^\[\]\n]+?)\s*\]/g, '$1($2)', "'close[1]' 같은 과거값 표기를 'close(1)'로 바꿨어요");
+      // 조건 ? 참 : 거짓  →  if(조건, 참, 거짓)   (한 문장에 하나만 있을 때)
+      const parts = s.split(/(;|\n)/);
+      let tern = false;
+      for (let i = 0; i < parts.length; i += 2) {
+        const m = /^(\s*(?:[A-Za-z_가-힣][A-Za-z0-9_가-힣]*\s*=(?!=)\s*)?)([^?:]+?)\s*\?\s*([^?:]+?)\s*:\s*([^?:]+?)(\s*)$/.exec(parts[i]);
+        if (m && !/\/\//.test(parts[i])) { parts[i] = m[1] + 'if(' + m[2].trim() + ', ' + m[3].trim() + ', ' + m[4].trim() + ')' + m[5]; tern = true; }
+      }
+      if (tern) { s = parts.join(''); notes.push("'조건 ? 참 : 거짓' 문법을 if(조건, 참, 거짓)으로 바꿨어요"); }
+      return { src: s, notes: notes };
+    }
+
+    // 2단계: 오류 하나에 대한 고칠 후보들
+    function fixCandidates(src, err, env) {
+      const info = err.info || {};
+      const out = [];
+      const add = function (s, why, extra) { out.push(Object.assign({ src: s, why: why, pos: info.pos || 0 }, extra || {})); };
+      let toks = null;
+      try { toks = lex(src); } catch (e) { toks = null; }
+      const tokAt = function (pos) { return toks ? toks.findIndex(function (t) { return t.pos === pos; }) : -1; };
+      const prevIdx = function (i) { let q = i - 1; while (q >= 0 && toks[q].t === 'nl') q--; return q; };
+      const nextIdx = function (i) { let q = i + 1; while (q < toks.length && toks[q].t === 'nl') q++; return q; };
+      const txt = function (node) { return src.slice(node.s, node.e); };
+      const argList = function (call) { return call.args.map(txt); };
+
+      switch (info.code) {
+        case 'char': {
+          const ch = info.ch;
+          if (ch === '?' || ch === ':') break; // 삼항 연산자: 1단계에서 못 바꾼 복잡한 경우
+          if (/[$#@`~\\{}\[\]]/.test(ch) || /[^\x00-\x7F가-힣ㄱ-ㆎ]/.test(ch)) add(splice(src, info.pos, info.pos + 1, ''), "쓸 수 없는 문자 '" + ch + "'를 지웠어요");
+          break;
+        }
+        case 'quote':
+          add(splice(src, info.pos, info.pos + 1, ''), '닫히지 않은 따옴표를 지웠어요');
+          break;
+        case 'expect': {
+          if (!toks) break;
+          const i = tokAt(info.pos), t = toks[i];
+          // 줄이 바뀐 뒤에 막혔으면 앞 줄 끝에 ')'가 빠진 것으로 본다
+          const newLine = src.slice(info.after, info.pos).indexOf(String.fromCharCode(10)) >= 0;
+          const closeIt = function () { add(splice(src, info.after, info.after, ')'), "닫는 괄호 ')'가 모자라서 넣었어요", { pos: info.after }); };
+          if (newLine) closeIt();
+          if (info.ctx === 'call' && isValueStart(t) && !newLine) add(splice(src, info.after, info.after, ','), '함수 인자 사이에 빠진 쉼표(,)를 넣었어요', { pos: info.after });
+          if (!newLine && !isValueStart(t) && !(t && t.t === 'op' && t.v === ',' && info.ctx === 'group')) closeIt();
+          break;
+        }
+        case 'sep': {
+          if (!toks) break;
+          const i = tokAt(info.pos), t = toks[i], pi = prevIdx(i), pt = pi >= 0 ? toks[pi] : null;
+          const nt = toks[nextIdx(i)];
+          if (t.t === 'op' && t.v === ')') add(splice(src, t.pos, t.end, ''), "짝이 없는 닫는 괄호 ')'를 지웠어요");
+          else if (t.t === 'id' && nt && nt.t === 'op' && nt.v === '=' && pt) add(splice(src, pt.end, pt.end, ';'), "문장 사이에 빠진 ';'를 넣었어요");
+          else if (pt && pt.t === 'num' && (t.t === 'id' || (t.t === 'op' && t.v === '('))) add(splice(src, pt.end, t.pos, ' * '), "숫자 뒤에 빠진 곱하기 '*'를 넣었어요");
+          else if (t.t === 'str') add(splice(src, t.pos, t.end, ''), '필요 없는 글자(따옴표 문자열)를 지웠어요');
+          break;
+        }
+        case 'value': {
+          if (!toks) break;
+          const i = tokAt(info.pos), t = toks[i], pi = prevIdx(i), pt = pi >= 0 ? toks[pi] : null;
+          const isBin = function (x) { return x && x.t === 'op' && BIN_OPS.has(x.v); };
+          if (t.t === 'op' && t.v === ')' && pt && pt.t === 'op' && pt.v === ',') add(splice(src, pt.pos, pt.end, ''), "괄호 앞의 남는 쉼표(,)를 지웠어요");
+          else if (t.t === 'op' && t.v === ',' && pt && pt.t === 'op' && (pt.v === ',' || pt.v === '(')) add(splice(src, t.pos, t.end, ''), '두 번 들어간 쉼표(,)를 지웠어요');
+          else if (isBin(t) && isBin(pt)) {
+            const between = src.slice(pt.end, t.pos);
+            const merged = pt.v + t.v;
+            // 앞이 대입 '=' 이면 (A = > 3 같은 경우) 뒤 기호만 지운다
+            const ppi = prevIdx(pi), assignEq = pt.v === '=' && ppi >= 0 && toks[ppi].t === 'id' && (prevIdx(ppi) < 0 || toks[prevIdx(ppi)].t === 'nl' || (toks[prevIdx(ppi)].t === 'op' && toks[prevIdx(ppi)].v === ';'));
+            if (!assignEq && /^\s+$/.test(between) && ['>=', '<=', '!=', '&&', '||'].indexOf(merged) >= 0) add(splice(src, pt.end, t.pos, ''), "띄어 쓴 '" + pt.v + ' ' + t.v + "'를 '" + merged + "'로 붙였어요");
+            else add(splice(src, t.pos, t.end, ''), "연산자가 두 번 들어가서 '" + src.slice(t.pos, t.end) + "'를 지웠어요");
+          } else if ((t.t === 'eof' || t.t === 'nl' || (t.t === 'op' && (t.v === ';' || t.v === ')'))) && pt && (isBin(pt) || (pt.t === 'op' && pt.v === ','))) {
+            const ppi = prevIdx(pi);
+            const danglingAssign = pt.v === '=' && ppi >= 0 && toks[ppi].t === 'id';
+            if (!danglingAssign) add(splice(src, pt.pos, pt.end, ''), "식 끝에 남은 '" + src.slice(pt.pos, pt.end) + "'를 지웠어요");
+          } else if (isBin(t) && (!pt || (pt.t === 'op' && (pt.v === '(' || pt.v === ',' || pt.v === ';')) || pt.t === 'nl')) add(splice(src, t.pos, t.end, ''), "앞에 값이 없는 '" + src.slice(t.pos, t.end) + "'를 지웠어요");
+          break;
+        }
+        case 'datavar': {
+          if (!toks) break;
+          const used = wordsIn(src);
+          let nn = /[가-힣]/.test(info.name) ? info.name + '값' : info.name + '1', k = 2;
+          while (used.has(nn.toLowerCase()) || DATA[nn.toLowerCase()] || B[nn.toLowerCase()] || env.known.has(nn.toLowerCase())) nn = (/[가-힣]/.test(info.name) ? info.name + '값' : info.name) + (k++);
+          const kk = info.name.toLowerCase();
+          let s2 = src;
+          toks.filter(function (t) { return t.t === 'id' && t.v.toLowerCase() === kk && (t.pos === info.pos || t.pos >= info.stmtEnd); })
+            .sort(function (a, b) { return b.pos - a.pos; })
+            .forEach(function (t) { s2 = splice(s2, t.pos, t.end, nn); });
+          add(s2, "'" + info.name + "'은(는) 가격 데이터 이름이라 변수 이름을 '" + nn + "'(으)로 바꿨어요");
+          break;
+        }
+        case 'selfref': {
+          let stmts = null;
+          try { stmts = parse(src); } catch (e) { break; }
+          const ui = stmts.findIndex(function (s) { return info.pos >= s.s && info.pos < s.e; });
+          const use = stmts[ui];
+          const k = info.name.toLowerCase();
+          const di = stmts.findIndex(function (s, j) { return j > ui && s.k === 'assign' && s.name.toLowerCase() === k; });
+          if (use && use.k === 'assign' && use.name.toLowerCase() === k) {
+            add(splice(src, info.pos, info.end, info.name + '(1)'), "자기 자신을 쓰는 '" + info.name + "'를 1봉 전 값 '" + info.name + "(1)'로 바꿨어요");
+          } else if (use && di > ui) {
+            const d = stmts[di];
+            let a = d.s, b = d.e;
+            while (b < src.length && /[ \t]/.test(src[b])) b++;
+            if (src[b] === ';') b++;
+            while (b < src.length && /[ \t]/.test(src[b])) b++;
+            if (src[b] === '\n') b++;
+            const defText = src.slice(d.s, d.e).trim();
+            let s2 = splice(src, a, b, '');
+            s2 = splice(s2, use.s, use.s, defText + ';\n');
+            add(s2, eul(info.name) + " 쓰기 전에 정의하도록 '" + info.name + " = …' 문장을 앞으로 옮겼어요");
+            add(splice(src, info.pos, info.end, info.name + '(1)'), eul(info.name) + " 1봉 전 값 '" + info.name + "(1)'로 바꿨어요");
+          } else add(splice(src, info.pos, info.end, info.name + '(1)'), eul(info.name) + " 1봉 전 값 '" + info.name + "(1)'로 바꿨어요");
+          break;
+        }
+        case 'lagargs': {
+          const c = info.call, as = argList(c);
+          if (!as.length) add(splice(src, info.pos, info.end, info.name), "'" + info.name + "()'의 빈 괄호를 지웠어요");
+          else add(splice(src, info.pos, info.end, info.name + '(' + as[0] + ')'), "'" + info.name + "(N)'은 N봉 전 값이라 괄호 안에 첫 값만 남겼어요");
+          break;
+        }
+        case 'matype': {
+          const w = String(info.word === null || info.word === undefined ? src.slice(info.pos, info.end) : info.word).trim();
+          let to = '단순';
+          MA_WORDS.forEach(function (m) { if (m[0].test(w)) to = m[1]; });
+          add(splice(src, info.pos, info.end, to), "이평 종류 '" + src.slice(info.pos, info.end) + "'를 '" + to + "'(으)로 바꿨어요");
+          break;
+        }
+        case 'arity': {
+          const c = info.call, k = c.name.toLowerCase(), as = argList(c), n = as.length;
+          const allowed = new Set(info.alts || []);
+          if (info.min !== undefined) for (let j = info.min; j <= Math.min(info.max, 12); j++) allowed.add(j);
+          const list = Array.from(allowed).sort(function (a, b) { return a - b; });
+          const rebuild = function (args) { return splice(src, c.s, c.e, c.name + '(' + args.join(', ') + ')'); };
+          if ((k === 'truerange' || k === 'tr') && n === 1) { add(splice(src, c.s, c.e, 'ATR(' + as[0] + ')'), "TrueRange는 인자가 없어요. 기간을 넣으려면 ATR이라 ATR(" + as[0] + ")로 바꿨어요"); break; }
+          const bigger = list.filter(function (x) { return x > n; });
+          const smaller = list.filter(function (x) { return x < n; });
+          if (!bigger.length || (smaller.length && n > list[list.length - 1])) {
+            const kk = smaller[smaller.length - 1];
+            add(rebuild(as.slice(0, kk)), c.name + ' 함수는 인자가 ' + kk + '개라 남는 인자를 뺐어요');
+            break;
+          }
+          const want = bigger[0];
+          if (SERIES_FN[k] !== undefined) {
+            const dataName = SERIES_DEFAULT_DATA[k] || 'C';
+            const firstIsData = n >= 1 && DATA[as[0].toLowerCase()] !== undefined;
+            if (n === 0) { add(rebuild([dataName, String(SERIES_FN[k])]), c.name + '에 데이터와 기간이 없어서 ' + dataName + ', ' + SERIES_FN[k] + '를 넣었어요 (값은 바꿔도 돼요)'); break; }
+            if (n === 1 && !firstIsData) { add(rebuild([dataName].concat(as)), c.name + '(데이터, 기간) 순서라 앞에 데이터 ' + dataName + '(' + (dataName === 'C' ? '종가' : dataName === 'H' ? '고가' : '저가') + ')를 넣었어요'); break; }
+            if (n === 1) { add(rebuild(as.concat([String(SERIES_FN[k])])), c.name + '에 기간이 없어서 ' + SERIES_FN[k] + '를 넣었어요 (값은 바꿔도 돼요)'); break; }
+          }
+          if ((k === 'crossup' || k === 'crossdown' || k === '상향돌파' || k === '하향돌파') && n === 1) { add(rebuild(as.concat(['0'])), c.name + '은 두 값이 필요해서 기준값 0을 넣었어요 (0선 돌파)'); break; }
+          if ((k === 'if' || k === 'iff' || k === '만일' || k === '만약') && n === 2) { add(rebuild(as.concat(['0'])), 'if(조건, 참값, 거짓값)에서 거짓값이 없어서 0을 넣었어요'); break; }
+          if ((k === 'shift' || k === '이동') && n === 1) { add(rebuild(as.concat(['1'])), 'shift에 몇 봉 전인지가 없어서 1을 넣었어요'); break; }
+          if ((k === 'barssince') && n === 0) break;
+          const defs = FN_DEFAULTS[k];
+          if (defs && defs.length >= want) {
+            const fill = defs.slice(n, want).map(String);
+            add(rebuild(as.concat(fill)), c.name + '에 모자란 값을 기본값 ' + fill.join(', ') + '(으)로 채웠어요');
+          } else if (env.userFn && env.userFn[k]) {
+            const fill = new Array(want - n).fill('14');
+            add(rebuild(as.concat(fill)), '사용자함수 ' + c.name + '에 모자란 인자를 임시값 14로 채웠어요 (알맞은 값으로 바꾸세요)');
+          }
+          break;
+        }
+        case 'unkfunc': {
+          const c = info.call, k = c.name.toLowerCase(), as = argList(c);
+          if (k === 'ref' && as.length === 2) { add(splice(src, c.s, c.e, 'shift(' + as[0] + ', ' + as[1].replace(/^\s*-\s*/, '') + ')'), 'Ref(값, -N)을 이 수식의 shift(값, N)로 바꿨어요'); break; }
+          if (k === 'change' || k === '변화') { add(splice(src, c.s, c.e, '(' + as[0] + ' - shift(' + as[0] + ', ' + (as[1] || '1') + '))'), 'change(값)을 (값 - N봉 전 값)으로 풀어 썼어요'); break; }
+          if ((k === 'rising' || k === 'falling') && as.length >= 1) {
+            const nn = as[1] || '1';
+            add(splice(src, c.s, c.e, (k === 'rising' ? '(' + as[0] + ' > shift(' + as[0] + ', ' + nn + '))' : '(' + as[0] + ' < shift(' + as[0] + ', ' + nn + '))')), k + '(값, N)을 비교식으로 풀어 썼어요');
+            break;
+          }
+          if ((k === 'stoch' || k === 'stochastic') && as.length === 4) { add(splice(src, c.s, c.e, 'StochasticsFast(' + as[3] + ')'), '트레이딩뷰 stoch(…)를 StochasticsFast(' + as[3] + ')로 바꿨어요'); break; }
+          const lexAlias = FN_ALIAS[k];
+          if (lexAlias) { add(splice(src, info.pos, info.end, lexAlias), "함수 이름 '" + c.name + "'를 이 수식에서 쓰는 '" + lexAlias + "'(으)로 바꿨어요"); break; }
+          const m = closest(c.name, env.funcNames);
+          if (m) add(splice(src, info.pos, info.end, m), "함수 이름 오타 '" + c.name + "'를 '" + m + "'(으)로 고쳤어요");
+          if (DATA[k] === undefined && env.known.has(k)) break;
+          break;
+        }
+        case 'unkname': {
+          const k = info.name.toLowerCase();
+          if (!info.lagged && ID_ALIAS[k]) { add(splice(src, info.pos, info.end, ID_ALIAS[k]), eul(info.name) + " 이 수식 문법 '" + ID_ALIAS[k] + "'(으)로 바꿨어요"); break; }
+          if (ID_ALIAS[k] && /^[A-Za-z]+$/.test(ID_ALIAS[k])) { add(splice(src, info.pos, info.end, ID_ALIAS[k]), eul(info.name) + " '" + ID_ALIAS[k] + "'(으)로 바꿨어요"); break; }
+          // MA20, EMA12, RSI14 처럼 이름에 기간을 붙여 쓴 경우
+          const mm = /^([A-Za-z가-힣]+?)_?(\d+)$/.exec(info.name);
+          if (mm && !info.lagged) {
+            const fk = mm[1].toLowerCase();
+            const fnName = FN_ALIAS[fk] || CANON[fk] || (env.funcTable[fk] && Object.values(env.funcTable[fk])[0].name) || (B[fk] ? fk : null);
+            if (fnName) {
+              const fl = fnName.toLowerCase();
+              let rep = null;
+              if (SERIES_FN[fl] !== undefined || fk === 'ma' || fk === 'mav') rep = (fk === 'ema' ? 'eavg' : fk === 'wma' ? 'wavg' : fk === 'ma' || fk === 'sma' || fk === 'mav' ? 'avg' : fnName) + '(' + (SERIES_DEFAULT_DATA[fl] || 'C') + ', ' + mm[2] + ')';
+              else if (env.funcTable[fl] && env.funcTable[fl][1]) rep = fnName + '(' + mm[2] + ')';
+              if (rep) { add(splice(src, info.pos, info.end, rep), eul(info.name) + " " + rep + '(으)로 풀어 썼어요'); break; }
+            }
+          }
+          const m = closest(info.name, env.idNames.concat(assignedNames(src)));
+          if (m) add(splice(src, info.pos, info.end, m), "이름 오타 '" + info.name + "'를 '" + m + "'(으)로 고쳤어요");
+          if (env.allowNewVars) {
+            const v = guessVarValue(info.name);
+            add(src, eul(info.name) + " 지표변수로 추가했어요 (임시값 " + v + ', 지표변수 칸에서 바꾸세요)', { newVar: [info.name, v] });
+          }
+          break;
+        }
+      }
+      return out;
+    }
+
+    // 3단계: 문법은 맞지만 결과가 이상해지는 흔한 실수
+    function lintFixes(src, env) {
+      let stmts;
+      try { stmts = parse(src); } catch (e) { return []; }
+      const edits = [];
+      function walk(e) {
+        if (!e || typeof e !== 'object') return;
+        if (e.k === 'call') {
+          const k = e.name.toLowerCase(), n = e.args.length;
+          const isData = function (a) { return a.k === 'id' && DATA[a.name.toLowerCase()] !== undefined; };
+          const fd = env.funcTable[k];
+          const lib = fd && fd[n] && !fd[n].user ? fd[n] : null;
+          if (lib && !env.assigned.has(k)) {
+            lib.params.forEach(function (pn, idx) {
+              const a = e.args[idx];
+              if (pn === 'A' || !a || !isData(a)) return;
+              if (n === 1 && fd[2] && fd[2].params[0] === 'A') {
+                const dv = (FN_DEFAULTS[k] || [14])[0];
+                edits.push({ s: e.s, e: e.e, txt: e.name + '(' + src.slice(a.s, a.e) + ', ' + dv + ')', why: e.name + '(' + a.name + ')는 ' + a.name + ' 값을 기간으로 써서 계산이 안 돼요. ' + e.name + '(' + a.name + ', ' + dv + ')로 바꿨어요' });
+              } else {
+                const dv = (FN_DEFAULTS[k] || [])[idx] || 14;
+                edits.push({ s: a.s, e: a.e, txt: String(dv), why: e.name + '의 ' + (idx + 1) + '번째 자리는 기간인데 가격(' + a.name + ')이 들어가 있어서 ' + dv + '(으)로 바꿨어요' });
+              }
+            });
+          } else if (SERIES_FN[k] !== undefined && n >= 2 && B[k]) {
+            const a0 = e.args[0], a1 = e.args[1];
+            if (a0.k === 'num' && isData(a1)) edits.push({ s: e.s, e: e.e, txt: e.name + '(' + [src.slice(a1.s, a1.e), src.slice(a0.s, a0.e)].concat(e.args.slice(2).map(function (x) { return src.slice(x.s, x.e); })).join(', ') + ')', why: e.name + '(데이터, 기간) 순서가 바뀌어 있어서 자리를 바꿨어요' });
+            else if (isData(a1)) edits.push({ s: a1.s, e: a1.e, txt: String(SERIES_FN[k]), why: e.name + '의 기간 자리에 가격(' + a1.name + ')이 들어가 있어서 ' + SERIES_FN[k] + '(으)로 바꿨어요' });
+            else if (a1.k === 'num' && a1.v < 1) edits.push({ s: a1.s, e: a1.e, txt: '1', why: e.name + '의 기간은 1 이상이어야 해서 1로 바꿨어요' });
+          }
+          e.args.forEach(walk);
+          return;
+        }
+        if (e.k === 'bin') { walk(e.a); walk(e.b); return; }
+        if (e.k === 'un') walk(e.a);
+      }
+      stmts.forEach(function (s) { walk(s.expr); });
+      return edits.filter(function (x) { return x.s !== undefined; }).sort(function (a, b) { return b.s - a.s; });
+    }
+
+    // opts: { userFuncs, vars, params(함수 본문용 인자 이름), allowNewVars }
+    function autoFix(src, opts) {
+      opts = opts || {};
+      const userFuncs = opts.userFuncs || [];
+      const funcTable = buildFuncTable(userFuncs);
+      const vars = Object.assign({}, opts.vars || {});
+      (opts.params || []).forEach(function (p) { vars[p] = 1; });
+      const newVars = {};
+      const userFn = {};
+      userFuncs.forEach(function (f) { if (f && f.name) userFn[f.name.toLowerCase()] = true; });
+      const funcNames = Object.keys(B).map(function (k) { return CANON[k] || k; })
+        .concat(Object.keys(funcTable).map(function (k) { const v = Object.values(funcTable[k])[0]; return v ? v.name : k; }));
+      const idNames = ['C', 'O', 'H', 'L', 'V', 'Close', 'Open', 'High', 'Low', 'Volume', '종가', '시가', '고가', '저가', '거래량', 'date', 'time', '일자', '시간', 'BarIndex', '봉번호', '거래대금']
+        .concat(Object.keys(vars)).concat(['DayOpen', 'DayHigh', 'DayLow', 'PredayOpen', 'PredayHigh', 'PredayLow', 'PredayClose', 'OBV', 'AD', '양봉', '음봉', 'TrueRange']);
+      const known = new Set(funcNames.concat(idNames).map(function (x) { return x.toLowerCase(); }));
+      const env = { funcNames: funcNames, idNames: idNames, known: known, funcTable: funcTable, userFn: userFn, allowNewVars: opts.allowNewVars !== false };
+      const changes = [];
+      function tryCompile(s, extra) {
+        try { compile(s, { funcTable: buildFuncTable(userFuncs), vars: Object.assign({}, vars, newVars, extra || {}) }); return null; } catch (e) { return e; }
+      }
+      const norm = normalizeSrc(String(src || ''));
+      let cur = norm.src;
+      norm.notes.forEach(function (n) { changes.push({ why: n }); });
+      const seen = new Set([cur]);
+      let err = tryCompile(cur);
+      for (let iter = 0; err && iter < 40; iter++) {
+        if (!err.info) break;
+        const cands = fixCandidates(cur, err, env);
+        let picked = null, pickedErr = null;
+        for (const c of cands) {
+          const extra = {};
+          if (c.newVar) extra[c.newVar[0]] = c.newVar[1];
+          const ne = tryCompile(c.src, extra);
+          if (!ne) { picked = c; pickedErr = null; break; }
+          const progress = !seen.has(c.src) || c.newVar;
+          if (progress && ne.info && !picked && (ne.info.pos > err.info.pos || ne.info.code !== err.info.code || ne.message !== err.message)) { picked = c; pickedErr = ne; }
+        }
+        if (!picked) break;
+        if (picked.newVar) newVars[picked.newVar[0]] = picked.newVar[1];
+        const line = lineOf(cur, picked.pos);
+        changes.push({ why: picked.why, line: line, before: lineText(cur, line), after: lineText(picked.src, lineOf(picked.src, picked.pos)), newVar: picked.newVar ? picked.newVar[0] : undefined });
+        cur = picked.src;
+        seen.add(cur);
+        err = pickedErr;
+      }
+      if (!err) {
+        const lint = lintFixes(cur, { funcTable: funcTable, assigned: new Set(assignedNames(cur).map(function (x) { return x.toLowerCase(); })) });
+        lint.forEach(function (ed) {
+          const next = splice(cur, ed.s, ed.e, ed.txt);
+          if (!tryCompile(next)) {
+            const line = lineOf(cur, ed.s);
+            changes.push({ why: ed.why, line: line, before: lineText(cur, line), after: lineText(next, line) });
+            cur = next;
+          }
+        });
+      }
+      return { src: cur, changed: cur !== src || Object.keys(newVars).length > 0, changes: changes, newVars: newVars, ok: !err, error: err ? err.message : null };
+    }
+
+    // 신호가 매 봉 나오는 '상태' 조건을 '처음 참이 된 봉'에만 나오게 바꾼다
+    //  A > B → CrossUp(A, B),  A < B → CrossDown(A, B),  그 밖 → X = 조건; X and !X(1)
+    function toEventFormula(src) {
+      const stmts = parse(src);
+      const last = stmts[stmts.length - 1];
+      const ex = last.expr;
+      const t = function (n) { return src.slice(n.s, n.e); };
+      if (last.k === 'expr' && ex.k === 'bin' && !ex.paren && ['>', '>=', '<', '<='].indexOf(ex.op) >= 0) {
+        const fn = ex.op[0] === '>' ? 'CrossUp' : 'CrossDown';
+        return { src: src.slice(0, ex.s) + fn + '(' + t(ex.a) + ', ' + t(ex.b) + ')' + src.slice(ex.e), how: eul(t(ex)) + " " + fn + '(' + t(ex.a) + ', ' + t(ex.b) + ')로 바꿔 돌파한 봉에만 신호가 나오게 했어요' };
+      }
+      if (last.k === 'assign') {
+        return { src: src.slice(0, last.e) + ';\n' + last.name + ' and !' + last.name + '(1)' + src.slice(last.e), how: '조건이 처음 참이 된 봉에만 신호가 나오도록 마지막 줄에 "' + last.name + ' and !' + last.name + '(1)"을 붙였어요' };
+      }
+      const used = wordsIn(src);
+      let nm = '신호조건', k = 2;
+      while (used.has(nm)) nm = '신호조건' + (k++);
+      return { src: src.slice(0, last.s) + nm + ' = ' + t(ex) + ';\n' + nm + ' and !' + nm + '(1)' + src.slice(last.e), how: '조건이 처음 참이 된 봉에만 신호가 나오도록 "' + nm + ' and !' + nm + '(1)" 형태로 바꿨어요' };
+    }
+    // 마지막 식이 'A and B and C'이면 각 부분을 따로 계산할 수 있게 나눈다 (어느 조건이 막는지 찾기용)
+    function splitAnd(src) {
+      const stmts = parse(src);
+      const last = stmts[stmts.length - 1];
+      if (last.k !== 'expr') return [];
+      const parts = [];
+      (function walk(e) { if (e.k === 'bin' && e.op === '&&' && !e.paren) { walk(e.a); walk(e.b); } else parts.push(e); })(last.expr);
+      if (parts.length < 2) return [];
+      const head = src.slice(0, last.s);
+      return parts.map(function (p) { const t = src.slice(p.s, p.e); return { text: t, src: head + t }; });
+    }
+
     // 함수 설명 (수식관리자 도움말)
     const DOCS = [
       ['데이터', [
@@ -1013,6 +1486,9 @@ function ccfMain() {
       runOnBars: runOnBars,
       truthy: truthy,
       DOCS: DOCS,
+      autoFix: autoFix,
+      toEventFormula: toEventFormula,
+      splitAnd: splitAnd,
     };
   }
 
@@ -2162,8 +2638,82 @@ function ccfMain() {
   }
 
   // -----------------------------------------------------------------------------
-  // 수식검증 / 성과검증
+  // 수식검증 / 성과검증 / 자동수정용 실행 점검
   // -----------------------------------------------------------------------------
+  // 정의 하나의 수식 칸 목록 (이름, 슬롯 번호, 읽기/쓰기)
+  function formulaFields(d) {
+    const F = [];
+    const f = function (label, slot, obj, k) { if (obj) F.push({ label: label, slot: slot, kind: slot < 8 ? 'value' : 'cond', get: function () { return obj[k] || ''; }, set: function (v) { obj[k] = v; } }); };
+    if (d.type === 'indicator') (d.lines || []).slice(0, 5).forEach(function (ln, j) { f(ln.name || ('수식' + (j + 1)), j, ln, 'formula'); });
+    if (d.type === 'signal') { f('매수 신호', 8, d.signal, 'buy'); f('매도 신호', 9, d.signal, 'sell'); }
+    if (d.type === 'strategy') { f('매수진입', 8, d.strategy, 'buyEntry'); f('매도진입', 9, d.strategy, 'sellEntry'); f('매수청산', 10, d.strategy, 'buyExit'); f('매도청산', 11, d.strategy, 'sellExit'); }
+    if (d.type === 'strength') { f('강세 조건', 12, d.strength, 'bull'); f('약세 조건', 13, d.strength, 'bear'); }
+    return F;
+  }
+  async function chartBars(n) {
+    const chart = activeChart();
+    if (!chart) return null;
+    const sym = chart.symbol(), res = chartRes();
+    return { sym: sym, res: res, bars: await fetchBars(sym, res, n || 1000) };
+  }
+  // 슬롯별 원래 값(참/거짓 변환 전)
+  function runSlots(d, bars) {
+    const ctx = ENG.makeCtx();
+    const rt = compileDef(d, null, ctx);
+    const raw = rt.progs.map(function () { return new Array(bars.length); });
+    for (let i = 0; i < bars.length; i++) { ctx.set(i, bars[i]); rt.progs.forEach(function (pg, j) { raw[j][i] = pg ? pg.run(i) : NaN; }); }
+    return raw;
+  }
+  function countTrue(d, src, bars) {
+    const one = ENG.runOnBars(bars, [src], { userFuncs: funcsFor(d), vars: d.vars })[0];
+    return one.filter(function (x) { return ENG.truthy(x); }).length;
+  }
+  // 문법은 맞지만 결과가 이상한 경우를 찾는다. fix 가 있으면 자동수정으로 고칠 수 있음
+  function semanticIssues(d, bars) {
+    const N = bars.length, out = [];
+    if (!N) return out;
+    const raw = runSlots(d, bars);
+    formulaFields(d).forEach(function (fd) {
+      const src = fd.get();
+      if (!src || !src.trim()) return;
+      const vals = raw[fd.slot] || [];
+      let fin = 0, tr = 0, lo = Infinity, hi = -Infinity, bin = true;
+      vals.forEach(function (x) {
+        if (isFinite(x)) { fin++; if (x < lo) lo = x; if (x > hi) hi = x; if (x !== 0 && x !== 1) bin = false; }
+        if (ENG.truthy(x)) tr++;
+      });
+      if (!fin) { out.push({ label: fd.label, msg: '계산 결과가 전부 "값 없음"이에요. 기간이 봉 개수(' + N + '개)보다 길거나, 0으로 나누는 부분이 있는지 확인하세요.' }); return; }
+      if (fd.kind === 'value') {
+        if (lo === hi) out.push({ label: fd.label, msg: '값이 계속 ' + (+lo.toPrecision(6)) + '(으)로 똑같아요. 수식이 의도대로인지 확인하세요.' });
+        else if (bin) out.push({ label: fd.label, msg: '0과 1만 나와요. 참/거짓 조건식이라 선이 계단 모양이 돼요. 신호로 쓰려면 [신호검색] 탭에 만드세요.' });
+        return;
+      }
+      if (tr === 0) {
+        let msg = N + '봉 동안 한 번도 참이 아니에요.';
+        try {
+          const parts = ENG.splitAnd(src);
+          const dead = parts.filter(function (pt) { try { return countTrue(d, pt.src, bars) === 0; } catch (e) { return false; } });
+          if (dead.length) msg += ' 막는 부분: ' + dead.map(function (pt) { return '"' + pt.text + '"'; }).join(', ') + ' (이 부분이 한 번도 참이 아니에요).';
+          else if (parts.length) msg += ' 조건 하나하나는 참이 되는데 동시에 참인 봉이 없어요. 서로 반대인 조건이 없는지 보세요.';
+          else msg += ' 숫자 범위(예: RSI는 0~100)나 비교 방향(> <)을 확인하세요.';
+        } catch (e) { /* 무시 */ }
+        out.push({ label: fd.label, msg: msg });
+        return;
+      }
+      if (d.type === 'signal' && N >= 50 && tr / N > 0.2) {
+        const msg = '신호가 ' + N + '봉 중 ' + tr + '번(' + Math.round(tr / N * 100) + '%) 나와서 거의 매 봉 표시돼요. "A > B"처럼 상태를 쓰면 조건이 계속되는 동안 매 봉 신호가 나요.';
+        let fix = null;
+        try {
+          const ev = ENG.toEventFormula(src);
+          ENG.compile(ev.src, { funcTable: ENG.buildFuncTable(funcsFor(d)), vars: d.vars });
+          fix = { field: fd, src: ev.src, how: ev.how };
+        } catch (e) { fix = null; }
+        out.push({ label: fd.label, msg: msg, fix: fix });
+      }
+    });
+    return out;
+  }
+
   async function verifyDef(d) {
     // 1) 컴파일
     compileDef(d);
@@ -2192,7 +2742,14 @@ function ccfMain() {
     } else if (d.type === 'strategy') {
       lines.push.apply(lines, backtest(bars, outs));
     }
-    return { text: lines.join('\n') };
+    let issues = [];
+    try { issues = semanticIssues(d, bars); } catch (e) { issues = []; }
+    if (issues.length) {
+      lines.push('', '⚠ 점검');
+      issues.forEach(function (is) { lines.push('· ' + is.label + ': ' + is.msg); });
+      if (issues.some(function (is) { return is.fix; })) lines.push('→ [자동수정]을 누르면 고칠 수 있는 항목이 있어요.');
+    }
+    return { text: lines.join('\n'), warn: issues.length > 0 };
   }
   function lastIndex(arr, f) { for (let i = arr.length - 1; i >= 0; i--) if (f(arr[i])) return i; return -1; }
   function fmtTime(t) {
@@ -2263,7 +2820,8 @@ function ccfMain() {
   .ccf-card h4{margin:0 0 6px;font-size:12px;color:#aeb8c7;font-weight:600;display:flex;align-items:center;gap:8px}
   .ccf-sec{font-size:12px;color:#8c97a8;margin:12px 0 4px;font-weight:600}
   .ccf-out{white-space:pre-wrap;background:#121820;border:1px solid #2f3946;border-radius:6px;padding:8px;font-size:12px;margin-top:8px;font-family:Consolas,monospace}
-  .ccf-out.err{border-color:#7a2a2a;color:#ff9b93}.ccf-out.ok{border-color:#245c3c;color:#9be3b5}
+  .ccf-out.err{border-color:#7a2a2a;color:#ff9b93}.ccf-out.ok{border-color:#245c3c;color:#9be3b5}.ccf-out.warn{border-color:#7a6224;color:#ffd77a}
+  .ccf-btn.fix{background:#3b2f63;border-color:#5c4a99;color:#e4dcff}.ccf-btn.fix:hover{background:#4a3b7c}
   .ccf-color{width:30px;height:24px;padding:0;border:1px solid #353f4d;border-radius:4px;background:none;cursor:pointer}
   .ccf-docs{width:300px;flex-shrink:0;border-left:1px solid #323c4a;overflow:auto;padding:8px 10px;font-size:12px}
   .ccf-docs h5{margin:10px 0 4px;color:#9fb3c8;font-size:12px}
@@ -2476,7 +3034,7 @@ function ccfMain() {
     function current() { return items().find(function (d) { return d.id === st.selId; }); }
     function select(id) {
       if (st.dirty && !window.confirm('저장하지 않은 변경 내용이 있습니다. 버릴까요?')) return false;
-      st.selId = id; const c = current(); st.draft = c ? clone(c) : null; st.dirty = false; render(); return true;
+      st.selId = id; const c = current(); st.draft = c ? clone(c) : null; st.dirty = false; st.undo = null; render(); return true;
     }
     function markDirty() { st.dirty = true; saveBtnState(); }
     let saveBtn = null;
@@ -2605,11 +3163,13 @@ function ccfMain() {
       const out = h('div', { class: 'ccf-out', style: { display: 'none' } });
       saveBtn = h('button', { class: 'ccf-btn pri', text: '저장', onclick: function () { doSave(out); } });
       saveBtnState();
-      const btns = [h('button', { class: 'ccf-btn', text: '수식검증', onclick: function () { doVerify(out); } }), saveBtn];
+      const btns = [h('button', { class: 'ccf-btn', text: '수식검증', onclick: function () { doVerify(out); } }),
+        h('button', { class: 'ccf-btn fix', text: '자동수정', title: '틀린 수식을 찾아 고칩니다 (저장 전까지는 되돌릴 수 있어요)', onclick: function () { doAutoFix(out); } }), saveBtn];
       if (!isFunc) btns.push(h('button', { class: 'ccf-btn', text: '저장 후 차트에 적용', onclick: async function () { if (doSave(out)) await applyToChart(current()); } }));
       btns.push(h('button', { class: 'ccf-btn', text: st.showDocs ? '함수설명 숨기기' : '함수설명', onclick: function () { st.showDocs = !st.showDocs; docs.style.display = st.showDocs ? '' : 'none'; renderMain(); } }));
       main.appendChild(h('div', { class: 'ccf-row', style: { marginTop: '12px' } }, btns));
       main.appendChild(out);
+      if (st.pendingOut) { const po = st.pendingOut; st.pendingOut = null; showOut(out, po.text, po.kind, po.extra); }
     }
 
     function renderIndicator(d) {
@@ -2675,10 +3235,76 @@ function ccfMain() {
       try {
         if (st.tab === 'func') { validate(clone(d)); showOut(out, '문법 정상', 'ok'); return; }
         const r = await verifyDef(d);
-        showOut(out, r.text, 'ok');
-      } catch (e) { showOut(out, '오류: ' + e.message, 'err'); }
+        showOut(out, r.text, r.warn ? 'warn' : 'ok', r.warn ? [fixBtn(out)] : null);
+      } catch (e) { showOut(out, '오류: ' + e.message, 'err', [fixBtn(out)]); }
     }
-    function showOut(out, text, kind) { out.style.display = ''; out.className = 'ccf-out ' + (kind || ''); out.textContent = text; }
+    function fixBtn(out) { return h('button', { class: 'ccf-btn fix', text: '자동수정 해보기', onclick: function () { doAutoFix(out); } }); }
+    function showOut(out, text, kind, extra) {
+      out.style.display = ''; out.className = 'ccf-out ' + (kind || ''); out.textContent = text;
+      if (extra && extra.length) out.appendChild(h('div', { class: 'ccf-row', style: { marginTop: '8px' } }, extra));
+      setTimeout(function () { try { out.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (e) { /* 무시 */ } }, 0);
+    }
+    // 자동수정: 문법 오류 → 흔한 실수 → (차트가 있으면) 실제 봉으로 돌려 보고 이상한 신호까지 고친다
+    async function doAutoFix(out) {
+      const d = st.draft; if (!d) return;
+      const before = clone(d);
+      showOut(out, '자동수정 중…', '');
+      const done = [], left = [], hints = [];
+      const fmtChange = function (label, c) {
+        let t = '· ' + label + (c.line ? ' ' + c.line + '번째 줄' : '') + ': ' + c.why;
+        if (c.before !== undefined && c.after !== undefined && c.before !== c.after) t += '\n    ' + c.before + '\n  → ' + c.after;
+        return t;
+      };
+      try {
+        if (st.tab === 'func') {
+          const others = LIB.funcs.filter(function (f) { return f.id !== d.id; });
+          const r = ENG.autoFix(d.body || '', { userFuncs: others, params: d.params || [], allowNewVars: false });
+          if (r.src !== d.body) d.body = r.src;
+          r.changes.forEach(function (c) { done.push(fmtChange('함수 본문', c)); });
+          if (!r.ok) left.push('· 함수 본문: ' + r.error);
+        } else {
+          d.vars = d.vars || {};
+          formulaFields(d).forEach(function (fd) {
+            const v = fd.get();
+            if (!v || !v.trim()) return;
+            const r = ENG.autoFix(v, { userFuncs: funcsFor(d), vars: d.vars, allowNewVars: true });
+            if (r.src !== v) fd.set(r.src);
+            Object.keys(r.newVars).forEach(function (k) { if (!(k in d.vars)) d.vars[k] = r.newVars[k]; });
+            r.changes.forEach(function (c) { done.push(fmtChange(fd.label, c)); });
+            if (!r.ok) left.push('· ' + fd.label + ': ' + r.error);
+          });
+          if (!left.length) {
+            let cb = null;
+            try { cb = await chartBars(1000); } catch (e) { cb = null; }
+            if (!cb) hints.push('차트가 열려 있지 않아 실제 봉으로 돌려 보는 점검은 건너뛰었어요.');
+            else {
+              semanticIssues(d, cb.bars).forEach(function (is) {
+                if (is.fix) { is.fix.field.set(is.fix.src); done.push('· ' + is.label + ': ' + is.fix.how + '\n    (' + is.msg + ')'); }
+                else hints.push('· ' + is.label + ': ' + is.msg);
+              });
+            }
+          }
+        }
+      } catch (e) { left.push('· ' + e.message); }
+      const lines = [];
+      if (done.length) lines.push('✔ 고친 내용 ' + done.length + '건', done.join('\n'));
+      else if (!left.length) lines.push('✔ 고칠 곳이 없어요. 수식이 정상이에요.');
+      if (left.length) lines.push('', '✘ 자동으로 못 고친 곳', left.join('\n'), '  → 오류 위치(줄 번호) 근처의 괄호·쉼표·이름을 직접 확인하세요.');
+      if (hints.length) lines.push('', 'ℹ 참고', hints.join('\n'));
+      if (done.length) lines.push('', '아직 저장되지 않았어요. 확인 후 [저장]을 누르세요. 마음에 안 들면 [되돌리기].');
+      const changed = JSON.stringify(before) !== JSON.stringify(d);
+      if (changed) { st.dirty = true; st.undo = before; }
+      const extra = [];
+      if (changed) extra.push(h('button', { class: 'ccf-btn', text: '되돌리기', onclick: function () {
+        if (!st.undo) return;
+        st.draft = st.undo; st.undo = null; st.dirty = true;
+        st.pendingOut = { text: '자동수정 전으로 되돌렸어요.', kind: '' };
+        renderMain();
+      } }));
+      st.pendingOut = { text: lines.join('\n'), kind: left.length ? 'err' : (hints.length && !done.length ? 'warn' : 'ok'), extra: extra };
+      if (changed) renderMain(); else { const po = st.pendingOut; st.pendingOut = null; showOut(out, po.text, po.kind, po.extra); }
+      saveBtnState();
+    }
 
     function render() { renderSide(); renderMain(); }
     const f = items()[0]; st.selId = f ? f.id : null; st.draft = f ? clone(f) : null;
